@@ -115,7 +115,8 @@ locales/
    - `ensure_runtime_tools()`：下载 Python 3.14.6（通过 uv managed python）、创建可重定位 `.venv`、复制 uv/adb/git 到 `.venv`；检测到 `.venv` 的 Python 低于 3.14.5 时会删除并重建整个环境
    - `git_update()`：通过 Python 脚本调用 `deploy.git.GitManager` 拉取最新代码（带重试，最多 20 次）
    - `uv_sync_project()`：执行 `uv sync --frozen --no-dev --no-install-project` 安装依赖
-4. `ManagedBackend::new()` 启动 `gui.py`，设置 `ALAS_LAUNCHER_PID` 环境变量，等待端口就绪（60 秒超时）
+   - `ensure_frontend_assets()`：调用仓库的 `deploy.frontend.ensure_frontend()` 构建 React 前端产物，已有对应版本时秒过；构建耗时取决于 npm 下载速度，冷启动可能数分钟（仓库里没有 `deploy/frontend.py` 时跳过）
+4. `ManagedBackend::new()` 启动 `gui.py`，设置 `ALAS_LAUNCHER_PID` 环境变量，等待端口就绪（5 分钟超时）；启动失败时错误页会附上最新一份 gui 日志的末尾
 5. 启动 SSE 通知流（`/api/notify_stream`），销毁 splash 窗口，显示 main 窗口
 
 ### 自定义 URI 协议
@@ -185,7 +186,7 @@ GitHub Actions（`.github/workflows/package.yml`）：
 - 默认 WebUI 端口：`22267`
 - Python 版本：`3.14.6`（`setup.rs` 中 `PYTHON_VERSION`）
 - Git 更新最大重试：20 次，间隔 1 秒
-- 后端端口等待超时：60 秒
+- 后端端口等待超时：5 分钟（超时后重建 `.venv` 并重试一次；前端构建在启动前完成，不占用该额度）
 - 后端连接检查超时：500 毫秒
 - 通知流断线重连间隔：3 秒
 - `UV_PYTHON_INSTALL_MIRROR` 默认使用 npmmirror 加速 Python standalone 下载，并以 python-standalone.org 作为备用源

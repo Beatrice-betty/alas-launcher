@@ -328,6 +328,66 @@ fn begin_startup_cleanup(
     });
 }
 
+/// 后端启动失败时最多展示的日志行数与字符数。
+const BACKEND_LOG_TAIL_LINES: usize = 12;
+const BACKEND_LOG_TAIL_CHARS: usize = 1200;
+
+/// 读取最新一份 gui 日志的末尾若干行，用于把启动失败原因显示给用户。
+///
+/// Args:
+///     log_dir: 日志目录（仓库下的 log/）。
+///     max_lines: 最多保留的行数。
+///     max_chars: 最多保留的字符数，超出时从更早的行开始丢弃。
+///
+/// Returns:
+///     Option<(文件名, 日志尾部)>：目录或日志不存在时返回 None。
+fn gui_log_tail(log_dir: &Path, max_lines: usize, max_chars: usize) -> Option<(String, String)> {
+    let newest = fs::read_dir(log_dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with("_gui.txt"))
+        })
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .max_by_key(|(modified, _)| *modified)?;
+
+    let content = fs::read_to_string(&newest.1).ok()?;
+    let lines: Vec<&str> = content.lines().filter(|line| !line.trim().is_empty()).collect();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for line in lines.iter().rev().take(max_lines) {
+        let cost = line.chars().count() + 1;
+        if !kept.is_empty() && used + cost > max_chars {
+            break;
+        }
+        used += cost;
+        kept.push(line);
+    }
+    kept.reverse();
+
+    let file = newest.1.file_name()?.to_str()?.to_owned();
+    Some((file, kept.join("\n")))
+}
+
+/// 后端启动失败的详情：附上最新 gui 日志的末尾，失败原因不必再去翻日志文件。
+fn backend_failure_detail(error: &str) -> String {
+    let mut detail = t!("dialog.backend_launch_failed", error = error).to_string();
+    let log_dir = setup::alas_repo_dir().join("log");
+    if let Some((file, tail)) =
+        gui_log_tail(&log_dir, BACKEND_LOG_TAIL_LINES, BACKEND_LOG_TAIL_CHARS)
+    {
+        warn!("Last lines of log/{file}:\n{tail}");
+        detail = format!(
+            "{detail}\n\n{}",
+            t!("dialog.backend_log_tail", file = file, log = tail)
+        );
+    }
+    detail
+}
+
 fn time_bomb_config() -> Result<Option<TimeBombConfig>> {
     let Some(section) = cargo_toml_section("package.metadata.alas-launcher.time-bomb") else {
         return Ok(None);
@@ -1875,6 +1935,68 @@ mod tests {
         assert!(!failed_part_path.exists());
         assert!(!failed_update_path.exists());
     }
+
+    #[test]
+    fn gui_log_tail_keeps_newest_gui_log_tail() {
+        let dir = test_log_dir("newest");
+        let older = dir.join("2026-09-20_gui.txt");
+        fs::write(&older, "old line\n").unwrap();
+        fs::write(dir.join("2026-09-21_gui.txt"), "line1\nline2\nline3\n").unwrap();
+        fs::write(dir.join("2026-09-21_launcher.txt"), "launcher\n").unwrap();
+        // 固定 mtime，不依赖文件系统的时间精度
+        fs::File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+
+        assert_eq!(
+            ("2026-09-21_gui.txt".to_owned(), "line1\nline2\nline3".to_owned()),
+            gui_log_tail(&dir, 10, 1000).unwrap()
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gui_log_tail_respects_line_and_char_budget() {
+        let dir = test_log_dir("budget");
+        fs::write(dir.join("2026-09-21_gui.txt"), "aaaa\nbbbb\n\ncccc\ndddd\n").unwrap();
+
+        assert_eq!(
+            ("2026-09-21_gui.txt".to_owned(), "cccc\ndddd".to_owned()),
+            gui_log_tail(&dir, 2, 1000).unwrap()
+        );
+        // 字符预算不足时丢弃更早的行，保留最新的一行
+        assert_eq!(
+            ("2026-09-21_gui.txt".to_owned(), "dddd".to_owned()),
+            gui_log_tail(&dir, 10, 5).unwrap()
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gui_log_tail_is_none_without_gui_log() {
+        assert!(gui_log_tail(Path::new("alas-launcher-missing-log-dir"), 5, 100).is_none());
+
+        let dir = test_log_dir("empty");
+        fs::write(dir.join("2026-09-21_launcher.txt"), "launcher\n").unwrap();
+        assert!(gui_log_tail(&dir, 5, 100).is_none());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn test_log_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "alas-launcher-log-tail-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 }
 
 /// Set macOS activation policy to Regular (show in dock) or Accessory (hide from dock).
@@ -2388,7 +2510,7 @@ fn main() -> Result<()> {
                                 }
                                 status_updater(SplashUpdate::error(
                                     t!("dialog.startup_failed"),
-                                    t!("dialog.backend_launch_failed", error = e.to_string()),
+                                    backend_failure_detail(&e.to_string()),
                                     last_progress.get().max(97),
                                 ));
                                 return;

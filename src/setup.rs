@@ -90,7 +90,15 @@ pub fn get_tip() -> String {
 enum ScriptPhase {
     Git,
     Dependencies,
+    Frontend,
 }
+
+/// 前端构建在主进度条上占用的区间：依赖同步（64..90）之后、收尾（94）之前。
+const FRONTEND_PROGRESS_START: u8 = 90;
+const FRONTEND_PROGRESS_END: u8 = 93;
+
+/// 前端构建的间隔计时上限（秒），超出后进度条停在区间末端。
+const FRONTEND_PROGRESS_ELAPSED_CAP: u16 = 120;
 
 #[derive(Default)]
 struct GitProgressState {
@@ -185,7 +193,7 @@ fn platform_git_config_path() -> &'static str {
     }
 }
 
-fn alas_repo_dir() -> PathBuf {
+pub(crate) fn alas_repo_dir() -> PathBuf {
     // Always check if this is a typical same-folder portable distribution
     let exe_folder = std::env::current_exe()
         .unwrap()
@@ -395,6 +403,8 @@ pub fn setup_alas_repo(
             .with_subtitle(t!("setup.syncing_deps", tip = get_tip())),
     );
     uv_sync_project(&mut status_updater, &bootstrap_uv, &cancel_requested)?;
+    status_updater(frontend_start_update());
+    ensure_frontend_assets(&mut status_updater, &cancel_requested)?;
     status_updater(
         SplashUpdate::loading(t!("setup.finishing"), t!("setup.ready_to_launch"), 94)
             .with_subtitle(t!("setup.launching", tip = get_tip())),
@@ -798,6 +808,7 @@ fn run_command(
     cancel_requested: &AtomicBool,
 ) -> Result<()> {
     let is_deps = matches!(phase, ScriptPhase::Dependencies);
+    let is_frontend = matches!(phase, ScriptPhase::Frontend);
 
     let mut child = cmd
         .create_no_window()
@@ -826,6 +837,8 @@ fn run_command(
     let mut uv_progress = UvProgressState::new();
     let mut dependency_progress = 64u8;
     let mut dependency_elapsed_secs = 0u16;
+    let mut frontend_progress = FRONTEND_PROGRESS_START;
+    let mut frontend_elapsed_secs = 0u16;
 
     // Receive lines and tee them to stdout/stderr and the status_updater callback.
     loop {
@@ -842,6 +855,9 @@ fn run_command(
                     if is_deps {
                         update.progress = update.progress.max(dependency_progress);
                         dependency_progress = update.progress;
+                    } else if is_frontend {
+                        // 进度由等待计时推进，输出行只更新提示文字。
+                        update.progress = update.progress.max(frontend_progress);
                     }
                     status_updater(update);
                 }
@@ -867,6 +883,12 @@ fn run_command(
                     );
                     dependency_progress = update.progress;
                     status_updater(update);
+                } else if is_frontend {
+                    // 首次构建时 npm 只在结束时输出摘要，用计时让用户看到进度没卡死。
+                    frontend_elapsed_secs = frontend_elapsed_secs.saturating_add(1);
+                    let update = frontend_wait_update(frontend_elapsed_secs, frontend_progress);
+                    frontend_progress = update.progress;
+                    status_updater(update);
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -882,6 +904,7 @@ fn run_command(
             last_err = match phase {
                 ScriptPhase::Git => t!("setup.update_failed").to_string(),
                 ScriptPhase::Dependencies => t!("setup.deps_failed").to_string(),
+                ScriptPhase::Frontend => t!("setup.frontend_failed").to_string(),
             };
         }
         return Err(anyhow!(last_err));
@@ -959,6 +982,7 @@ fn phase_display_name(phase: ScriptPhase) -> String {
     match phase {
         ScriptPhase::Git => t!("setup.code_update").to_string(),
         ScriptPhase::Dependencies => t!("setup.deps_update").to_string(),
+        ScriptPhase::Frontend => t!("setup.frontend_title").to_string(),
     }
 }
 
@@ -975,7 +999,36 @@ fn splash_retry_update(phase: ScriptPhase, retry_count: usize, error_text: &str)
         ScriptPhase::Dependencies => SplashUpdate::loading(t!("setup.retrying_deps"), detail, 64)
             .with_subtitle(t!("setup.syncing_deps", tip = get_tip()))
             .with_uv_progress(2, t!("setup.uv_resolving", secs = "0")),
+        ScriptPhase::Frontend => {
+            SplashUpdate::loading(t!("setup.retrying_frontend"), detail, FRONTEND_PROGRESS_START)
+                .with_subtitle(t!("setup.syncing", tip = get_tip()))
+        }
     }
+}
+
+fn frontend_start_update() -> SplashUpdate {
+    SplashUpdate::loading(
+        t!("setup.frontend_title"),
+        t!("setup.frontend_checking"),
+        FRONTEND_PROGRESS_START,
+    )
+}
+
+fn frontend_wait_update(elapsed_secs: u16, current_progress: u8) -> SplashUpdate {
+    let progress = current_progress.max(scale_progress(
+        elapsed_secs.min(FRONTEND_PROGRESS_ELAPSED_CAP) as u8,
+        FRONTEND_PROGRESS_START,
+        FRONTEND_PROGRESS_END,
+    ));
+    SplashUpdate::loading(
+        t!("setup.frontend_title"),
+        t!("setup.frontend_elapsed", secs = elapsed_secs.to_string()),
+        progress,
+    )
+}
+
+fn frontend_line_update(line: &str) -> SplashUpdate {
+    SplashUpdate::loading(t!("setup.frontend_title"), line, FRONTEND_PROGRESS_START)
 }
 
 fn dependency_start_update() -> SplashUpdate {
@@ -1096,6 +1149,27 @@ fn uv_sync_project(
     }
 
     Err(last_error.unwrap_or_else(|| anyhow!(t!("setup.deps_failed").to_string())))
+}
+
+/// 构建 React 前端产物，必须在启动 gui.py 之前完成。
+///
+/// 冷启动时 `npm ci` + 构建可能耗时数分钟，而启动器等待 WebUI 端口就绪只有 5 分钟；
+/// 放在安装阶段完成，后端启动就不会因为前端构建超时而永远起不来。
+fn ensure_frontend_assets(
+    status_updater: impl FnMut(SplashUpdate),
+    cancel_requested: &AtomicBool,
+) -> Result<()> {
+    let repo_dir = alas_repo_dir();
+    if !repo_dir.join("deploy").join("frontend.py").is_file() {
+        info!("No deploy/frontend.py in the checkout, skipping frontend build");
+        return Ok(());
+    }
+
+    let script = "from deploy.frontend import ensure_frontend; ensure_frontend()";
+    let mut cmd = Command::new(venv_python());
+    cmd.args(["-c", script]).current_dir(&repo_dir);
+    isolate_python_child_environment(&mut cmd);
+    run_command(&mut cmd, status_updater, ScriptPhase::Frontend, cancel_requested)
 }
 
 /// Resolve `uv.lock` so its download URLs come from `index`, recording a failure.
@@ -2116,6 +2190,7 @@ fn splash_update_for_output(
     match phase {
         ScriptPhase::Git => splash_update_for_git_output(sanitized, git_progress),
         ScriptPhase::Dependencies => splash_update_for_dependency_output(sanitized, uv_progress),
+        ScriptPhase::Frontend => Some(frontend_line_update(sanitized)),
     }
 }
 
