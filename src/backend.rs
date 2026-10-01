@@ -167,6 +167,9 @@ fn value_as_string_list(value: &JsonValue) -> Vec<String> {
 
 pub struct ManagedBackend {
     child: Option<GroupChild>,
+    pid: u32,
+    created_at: Option<u64>,
+    exit_observed: bool,
 }
 
 impl ManagedBackend {
@@ -181,16 +184,22 @@ impl ManagedBackend {
         command.env(TRUST_SECRET_ENV, launcher_trust_secret());
         isolate_python_child_environment(&mut command);
         let child = command.group().create_no_window().spawn()?;
-        let mut res = Self { child: Some(child) };
+        let pid = child.id();
+        let system = sysinfo::System::new_all();
+        let created_at = system.process(sysinfo::Pid::from_u32(pid)).map(|process| process.start_time());
+        crate::diagnostics::record("backend_spawn", serde_json::json!({"target_pid": pid, "target_created_at": created_at}));
+        let mut res = Self { child: Some(child), pid, created_at, exit_observed: false };
 
         let address = format!("127.0.0.1:{}", config.port).parse().unwrap();
         let start_time = std::time::Instant::now();
         while start_time.elapsed() < BACKEND_STARTUP_TIMEOUT {
             if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+                crate::diagnostics::record("backend_port_ready", serde_json::json!({"target_pid": pid, "port": config.port}));
                 return Ok(res);
             }
             if let Some(child) = res.child.as_mut() {
                 if let Some(status) = child.try_wait()? {
+                    crate::diagnostics::record("backend_startup_exit", crate::diagnostics::exit_fields(status));
                     return Err(anyhow!(
                         "Backend exited before port {} was ready: {}",
                         config.port,
@@ -211,6 +220,8 @@ impl ManagedBackend {
 
     pub fn terminate(&mut self) -> Result<ExitStatus> {
         if let Some(mut child) = self.child.take() {
+            crate::diagnostics::record("terminate_intent", serde_json::json!({"trigger_reason": "ManagedBackend.terminate",
+                "target_pid": self.pid, "target_created_at": self.created_at, "method": "process_group"}));
             #[cfg(unix)]
             {
                 use command_group::{Signal, UnixChildExt};
@@ -218,16 +229,54 @@ impl ManagedBackend {
                 let start_time = std::time::Instant::now();
                 while start_time.elapsed() < Duration::from_millis(500) {
                     if let Ok(Some(exit_status)) = child.try_wait() {
+                        let mut fields = crate::diagnostics::exit_fields(exit_status);
+                        fields["target_pid"] = serde_json::json!(self.pid);
+                        crate::diagnostics::record("terminate_result", fields);
                         return Ok(exit_status);
                     }
                     sleep(Duration::from_millis(100));
                 }
                 warn!("gui.py didn't exit, killing it...");
             }
-            child.kill()?;
-            Ok(child.wait()?)
+            child.kill().map_err(|error| {
+                crate::diagnostics::record("terminate_result", serde_json::json!({"target_pid": self.pid,
+                    "success": false, "stage": "kill", "error": error.to_string()}));
+                error
+            })?;
+            let status = child.wait().map_err(|error| {
+                crate::diagnostics::record("terminate_result", serde_json::json!({"target_pid": self.pid,
+                    "success": false, "stage": "wait", "error": error.to_string()}));
+                error
+            })?;
+            let mut fields = crate::diagnostics::exit_fields(status);
+            fields["target_pid"] = serde_json::json!(self.pid);
+            crate::diagnostics::record("terminate_result", fields);
+            Ok(status)
         } else {
             Ok(ExitStatus::default())
+        }
+    }
+
+    pub fn pid(&self) -> u32 { self.pid }
+
+    pub fn exited(&self) -> bool { self.exit_observed }
+
+    pub fn observe_exit(&mut self) {
+        if self.exit_observed { return; }
+        if let Some(child) = self.child.as_mut() {
+            // 单独检查根进程，不能等待整个 Job（根退出后仍可能有孤儿 worker）。
+            match child.inner().try_wait() {
+                Ok(Some(status)) => {
+                    self.exit_observed = true;
+                    let mut fields = crate::diagnostics::exit_fields(status);
+                    fields["target_pid"] = serde_json::json!(self.pid);
+                    fields["target_created_at"] = serde_json::json!(self.created_at);
+                    crate::diagnostics::record("backend_exit_observed", fields);
+                    warn!("Python 后端根进程已退出，PID={}，状态={}；诊断模式不自动重启", self.pid, status);
+                }
+                Ok(None) => {},
+                Err(error) => crate::diagnostics::record("backend_wait_error", serde_json::json!({"target_pid": self.pid, "error": error.to_string()})),
+            }
         }
     }
 }
@@ -254,13 +303,17 @@ fn kill_processes_using_port(port: u16) -> Result<()> {
         let sys_pid = sysinfo::Pid::from_u32(pid);
         match sys.process(sys_pid) {
             Some(process) => {
+                crate::diagnostics::record("terminate_intent", serde_json::json!({"trigger_reason": "kill_processes_using_port",
+                    "target_pid": pid, "target_created_at": process.start_time(), "method": "kill", "port": port}));
                 info!(
                     "Killing process {} ({}) using configured WebUI port {}",
                     pid,
                     process.name().to_string_lossy(),
                     port
                 );
-                if !process.kill() {
+                let killed = process.kill();
+                crate::diagnostics::record("terminate_result", serde_json::json!({"target_pid": pid, "signal_sent": killed}));
+                if !killed {
                     warn!("Failed to kill process {} using port {}", pid, port);
                 }
             }
@@ -290,7 +343,7 @@ fn kill_processes_using_port(port: u16) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn pids_using_tcp_port(port: u16) -> Result<BTreeSet<u32>> {
+pub(crate) fn pids_using_tcp_port(port: u16) -> Result<BTreeSet<u32>> {
     let output = Command::new("netstat")
         .args(["-ano", "-p", "tcp"])
         .create_no_window()
@@ -321,7 +374,7 @@ fn parse_windows_netstat_pids(output: &[u8], port: u16) -> BTreeSet<u32> {
 }
 
 #[cfg(unix)]
-fn pids_using_tcp_port(port: u16) -> Result<BTreeSet<u32>> {
+pub(crate) fn pids_using_tcp_port(port: u16) -> Result<BTreeSet<u32>> {
     let output = Command::new("lsof")
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
         .create_no_window()
@@ -347,9 +400,15 @@ fn local_address_uses_port(address: &str, port: u16) -> bool {
 impl Drop for ManagedBackend {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
+            crate::diagnostics::record("terminate_intent", serde_json::json!({"trigger_reason": "ManagedBackend.drop",
+                "target_pid": self.pid, "target_created_at": self.created_at, "method": "process_group"}));
             match child.kill() {
-                Ok(_) => {}
-                Err(e) => warn!("Failed to kill gui.py process: {:?}", e),
+                Ok(_) => crate::diagnostics::record("terminate_result", serde_json::json!({"target_pid": self.pid, "signal_sent": true})),
+                Err(e) => {
+                    crate::diagnostics::record("terminate_result", serde_json::json!({"target_pid": self.pid,
+                        "success": false, "error": e.to_string()}));
+                    warn!("Failed to kill gui.py process: {:?}", e);
+                },
             }
         }
         // Kill potential leaked processes
@@ -360,7 +419,10 @@ impl Drop for ManagedBackend {
                     && var.to_str().unwrap_or_default()
                         == format!("ALAS_LAUNCHER_PID={}", std::process::id())
                 {
-                    process.kill();
+                    crate::diagnostics::record("terminate_intent", serde_json::json!({"trigger_reason": "ManagedBackend.drop_leaked_process",
+                        "target_pid": pid.as_u32(), "target_created_at": process.start_time(), "method": "kill"}));
+                    let killed = process.kill();
+                    crate::diagnostics::record("terminate_result", serde_json::json!({"target_pid": pid.as_u32(), "signal_sent": killed}));
                 }
             }
         }

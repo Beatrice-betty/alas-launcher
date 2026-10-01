@@ -521,7 +521,11 @@ fn kill_runtime_processes(repo_dir: &Path) {
                 pid,
                 process.name().to_string_lossy()
             );
-            if !process.kill() {
+            crate::diagnostics::record("terminate_intent", serde_json::json!({"trigger_reason": "kill_runtime_processes",
+                "target_pid": pid.as_u32(), "target_created_at": process.start_time(), "method": "kill"}));
+            let killed = process.kill();
+            crate::diagnostics::record("terminate_result", serde_json::json!({"target_pid": pid.as_u32(), "signal_sent": killed}));
+            if !killed {
                 warn!("Failed to kill runtime process {}", pid);
             }
         }
@@ -843,8 +847,7 @@ fn run_command(
     // Receive lines and tee them to stdout/stderr and the status_updater callback.
     loop {
         if cancel_requested.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::diagnostics::cancel_child(&mut child, "run_command");
             bail!(t!("setup.cancel_cleaning"));
         }
         match rx.recv_timeout(Duration::from_secs(1)) {
@@ -965,8 +968,7 @@ fn run_status_command_with_tick(
     let mut child = cmd.create_no_window().spawn()?;
     loop {
         if cancel_requested.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::diagnostics::cancel_child(&mut child, "run_status_command_with_tick");
             bail!(t!("setup.cancel_cleaning"));
         }
 

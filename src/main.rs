@@ -3,6 +3,7 @@
 
 mod autostart;
 mod backend;
+mod diagnostics;
 mod i18n;
 mod launcher_control;
 mod nodejs;
@@ -1581,18 +1582,19 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_log_file_replaces_existing_contents() {
+    fn test_prepare_log_file_preserves_previous_session() {
         let temp_dir = TempDirBuilder::new()
-            .prefix("launcher-log-truncate-test-")
+            .prefix("launcher-log-append-test-")
             .tempdir()
             .expect("create temporary log directory");
         let filename = "launcher.txt";
         let path = temp_dir.path().join(filename);
         fs::write(&path, "old launcher log").expect("write old log");
 
-        truncate_log_file(temp_dir.path(), filename).expect("truncate launcher log");
+        prepare_log_file(temp_dir.path(), filename).expect("prepare launcher log");
+        prepare_log_file(temp_dir.path(), filename).expect("prepare second session");
 
-        assert_eq!(fs::read(&path).expect("read truncated log"), b"");
+        assert_eq!(fs::read(&path).expect("read previous log"), b"old launcher log");
     }
 
     #[test]
@@ -2103,12 +2105,15 @@ fn main() -> Result<()> {
     }
     setup_environment()?;
     let _log_guard = initialize_logging()?;
+    diagnostics::initialize_session();
     crate::i18n::init();
     let preview_crash = preview_crash_arg_present();
     let preview_no_update = preview_crash || preview_no_update_arg_present();
     let start_minimized = start_minimized_arg_present();
 
     info!("=== AzurPilot starting ===");
+    info!("启动会话={} PID={} 版本={}", std::env::var("AZURPILOT_DIAGNOSTIC_SESSION").unwrap_or_default(),
+          std::process::id(), env!("CARGO_PKG_VERSION"));
     info!("Launcher log file: log/{}", today_launcher_log_filename());
     if preview_no_update {
         info!("Preview no-update mode enabled; skipping launcher update check");
@@ -2517,6 +2522,8 @@ fn main() -> Result<()> {
                             }
                         };
                         *backend.lock().unwrap() = Some(b);
+                        diagnostics::start_observer(backend.clone(), port,
+                            webui_config.ssl_key.is_some() && webui_config.ssl_cert.is_some(), allow_exit.clone());
                         let notification_click: NotificationClickHandler = {
                             let app_handle = app_handle.clone();
                             let recreating_main_window = recreating_main_window_for_notify.clone();
@@ -2590,6 +2597,7 @@ fn main() -> Result<()> {
 
                     debug!("allow_exit is TRUE, proceeding with app shutdown");
                     info!("App exit allowed, shutting down backend...");
+                    diagnostics::record("launcher_exit_intent", serde_json::json!({"trigger_reason": "allowed_exit"}));
                     if let Some(ref mut b) = *backend.lock().unwrap() {
                         if let Err(e) = b.terminate() {
                             warn!("Failed to terminate backend process: {:?}", e);
@@ -2680,7 +2688,7 @@ fn main() -> Result<()> {
 fn initialize_logging() -> Result<WorkerGuard> {
     let log_dir = Path::new("log");
     let log_filename = today_launcher_log_filename();
-    truncate_log_file(log_dir, &log_filename)?;
+    prepare_log_file(log_dir, &log_filename)?;
     let file_appender = tracing_appender::rolling::never(log_dir, log_filename);
     let (non_blocking_file, guard) = tracing_appender::non_blocking(file_appender);
 
@@ -2701,11 +2709,12 @@ fn initialize_logging() -> Result<WorkerGuard> {
     Ok(guard)
 }
 
-fn truncate_log_file(log_dir: &Path, filename: &str) -> Result<()> {
+fn prepare_log_file(log_dir: &Path, filename: &str) -> Result<()> {
     fs::create_dir_all(log_dir)?;
     let path = log_dir.join(filename);
-    fs::File::create(&path)
-        .with_context(|| format!("truncate launcher log file {}", path.display()))?;
+    // 同日再次启动仍追加；保留固定文件名兼容现有日志下载入口。
+    fs::OpenOptions::new().create(true).append(true).open(&path)
+        .with_context(|| format!("open launcher log file {}", path.display()))?;
     Ok(())
 }
 

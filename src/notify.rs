@@ -90,7 +90,7 @@ pub fn start_notify_stream(
             info!("Connecting to notify stream: {url}");
             match read_notify_stream(&client, &url, &app, &allow_exit, &on_click) {
                 Ok(()) => debug!("Notify stream ended"),
-                Err(e) => warn!("Notify stream disconnected: {e}"),
+                Err(e) => warn!("Notify stream disconnected: {e:#}"),
             }
 
             if !allow_exit.load(Ordering::SeqCst) {

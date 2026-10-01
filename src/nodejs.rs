@@ -447,8 +447,7 @@ fn run_nodejs_installer(
 
     loop {
         if cancel_requested.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::diagnostics::cancel_child(&mut child, "nodejs_installer");
             bail!(t!("setup.cancel_cleaning"));
         }
 

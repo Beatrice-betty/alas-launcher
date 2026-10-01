@@ -45,7 +45,7 @@ pub fn start_launcher_control_stream(port: u16, allow_exit: Arc<AtomicBool>) {
             info!("Connecting to launcher control stream: {stream_url}");
             match read_launcher_control_stream(&client, &stream_url, &report_url, &allow_exit) {
                 Ok(()) => debug!("Launcher control stream ended"),
-                Err(e) => warn!("Launcher control stream disconnected: {e}"),
+                Err(e) => warn!("Launcher control stream disconnected: {e:#}"),
             }
 
             if !allow_exit.load(Ordering::SeqCst) {

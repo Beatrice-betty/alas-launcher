@@ -43,7 +43,7 @@ message = "测试已结束，请安装正式版"
 nix = { version = "0.30", features = ["signal"] }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["consoleapi", "fileapi", "minwinbase", "processenv", "sddl", "sysinfoapi", "winbase", "winuser"] }
+winapi = { version = "0.3", features = ["consoleapi", "fileapi", "handleapi", "minwinbase", "processthreadsapi", "processenv", "sddl", "sysinfoapi", "winbase", "winuser"] }
 tauri-winrt-notification = "0.7.2"
 windows-registry = "0.4"
 
