@@ -33,17 +33,17 @@ A cross-platform desktop launcher for [AzurPilot](https://github.com/wess09/Azur
   <img src="https://img.shields.io/badge/i18n-4%20Languages-blueviolet.svg?style=flat-square" alt="i18n: 4 Languages">
   <img src="https://img.shields.io/badge/Update-Git%20%2B%20uv%20Sync-brightgreen.svg?style=flat-square" alt="Update: Git + uv Sync">
   <img src="https://img.shields.io/badge/Self%20Update-mTLS%20Secured-orange.svg?style=flat-square" alt="Self Update: mTLS">
-  <a href="https://deepwiki.com/wess09/alas-launcher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
+  <a href="https://deepwiki.com/wess09/AzurPilotLauncher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
 </p>
 
 <!-- Repository dynamics and community metric badges -->
 <p align="center">
-  <a href="https://github.com/wess09/alas-launcher/releases/latest"><img src="https://img.shields.io/github/v/release/wess09/alas-launcher?style=flat-square&color=007ec6&label=Latest%20Release" alt="Latest Release"></a>
-  <a href="https://github.com/wess09/alas-launcher/releases"><img src="https://img.shields.io/github/downloads/wess09/alas-launcher/total?style=flat-square&color=28a745&label=Downloads" alt="Total Downloads"></a>
-  <a href="https://github.com/wess09/alas-launcher/stargazers"><img src="https://img.shields.io/github/stars/wess09/alas-launcher?style=flat-square&color=f5a623&label=Stars" alt="Stars"></a>
-  <a href="https://github.com/wess09/alas-launcher/network/members"><img src="https://img.shields.io/github/forks/wess09/alas-launcher?style=flat-square&color=6f42c1&label=Forks" alt="Forks"></a>
-  <a href="https://github.com/wess09/alas-launcher/issues"><img src="https://img.shields.io/github/issues/wess09/alas-launcher?style=flat-square&color=d73a49&label=Issues" alt="Open Issues"></a>
-  <a href="https://github.com/wess09/alas-launcher/commits/main"><img src="https://img.shields.io/github/last-commit/wess09/alas-launcher?style=flat-square&color=586069&label=Last%20Commit" alt="Last Commit"></a>
+  <a href="https://github.com/wess09/AzurPilotLauncher/releases/latest"><img src="https://img.shields.io/github/v/release/wess09/AzurPilotLauncher?style=flat-square&color=007ec6&label=Latest%20Release" alt="Latest Release"></a>
+  <a href="https://github.com/wess09/AzurPilotLauncher/releases"><img src="https://img.shields.io/github/downloads/wess09/AzurPilotLauncher/total?style=flat-square&color=28a745&label=Downloads" alt="Total Downloads"></a>
+  <a href="https://github.com/wess09/AzurPilotLauncher/stargazers"><img src="https://img.shields.io/github/stars/wess09/AzurPilotLauncher?style=flat-square&color=f5a623&label=Stars" alt="Stars"></a>
+  <a href="https://github.com/wess09/AzurPilotLauncher/network/members"><img src="https://img.shields.io/github/forks/wess09/AzurPilotLauncher?style=flat-square&color=6f42c1&label=Forks" alt="Forks"></a>
+  <a href="https://github.com/wess09/AzurPilotLauncher/issues"><img src="https://img.shields.io/github/issues/wess09/AzurPilotLauncher?style=flat-square&color=d73a49&label=Issues" alt="Open Issues"></a>
+  <a href="https://github.com/wess09/AzurPilotLauncher/commits/main"><img src="https://img.shields.io/github/last-commit/wess09/AzurPilotLauncher?style=flat-square&color=586069&label=Last%20Commit" alt="Last Commit"></a>
 </p>
 
 <p align="center">
@@ -79,13 +79,13 @@ A cross-platform desktop launcher for [AzurPilot](https://github.com/wess09/Azur
   </thead>
   <tbody>
     <tr>
-      <td width="25%"><b>Latest Release</b><br><a href="https://github.com/wess09/alas-launcher/releases/latest"><img src="https://img.shields.io/github/v/release/wess09/alas-launcher?style=flat-square&color=007ec6" alt="Release"></a></td>
-      <td width="25%"><b>Total Downloads</b><br><a href="https://github.com/wess09/alas-launcher/releases"><img src="https://img.shields.io/github/downloads/wess09/alas-launcher/total?style=flat-square&color=28a745" alt="Downloads"></a></td>
+      <td width="25%"><b>Latest Release</b><br><a href="https://github.com/wess09/AzurPilotLauncher/releases/latest"><img src="https://img.shields.io/github/v/release/wess09/AzurPilotLauncher?style=flat-square&color=007ec6" alt="Release"></a></td>
+      <td width="25%"><b>Total Downloads</b><br><a href="https://github.com/wess09/AzurPilotLauncher/releases"><img src="https://img.shields.io/github/downloads/wess09/AzurPilotLauncher/total?style=flat-square&color=28a745" alt="Downloads"></a></td>
       <td width="25%"><b>Open Source License</b><br><a href="./LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="GPL-3.0"></a></td>
-      <td width="25%"><b>Automated Build</b><br><a href="https://github.com/wess09/alas-launcher/actions"><img src="https://img.shields.io/badge/CI-GitHub%20Actions-2088FF?style=flat-square&logo=githubactions&logoColor=white" alt="CI Status"></a></td>
+      <td width="25%"><b>Automated Build</b><br><a href="https://github.com/wess09/AzurPilotLauncher/actions"><img src="https://img.shields.io/badge/CI-GitHub%20Actions-2088FF?style=flat-square&logo=githubactions&logoColor=white" alt="CI Status"></a></td>
     </tr>
     <tr>
-      <td width="25%"><b>Repository Size</b><br><img src="https://img.shields.io/github/repo-size/wess09/alas-launcher?style=flat-square&color=586069" alt="Repo Size"></td>
+      <td width="25%"><b>Repository Size</b><br><img src="https://img.shields.io/github/repo-size/wess09/AzurPilotLauncher?style=flat-square&color=586069" alt="Repo Size"></td>
       <td width="25%"><b>Code Language</b><br><img src="https://img.shields.io/badge/Language-Rust%20%7C%20Tauri-DEA584?style=flat-square&logo=rust&logoColor=white" alt="Language"></td>
       <td width="25%"><b>Runtime</b><br><img src="https://img.shields.io/badge/Python-3.14.6%20%2B%20uv-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python Runtime"></td>
       <td width="25%"><b>UI Languages</b><br><img src="https://img.shields.io/badge/i18n-%E7%AE%80%E4%BD%93%20%7C%20%E7%B9%81%E9%AB%94%20%7C%20%E6%97%A5%E6%9C%AC%E8%AA%9E%20%7C%20En-blueviolet?style=flat-square" alt="i18n"></td>
@@ -93,11 +93,11 @@ A cross-platform desktop launcher for [AzurPilot](https://github.com/wess09/Azur
     <tr>
       <td colspan="4">
         <b>Quick Actions:</b>
-        <a href="https://github.com/wess09/alas-launcher/releases/latest"><img src="https://img.shields.io/badge/Release-Download%20Latest-0052cc?style=flat-square&logo=github&logoColor=white" alt="Download"></a>
-        <a href="https://deepwiki.com/wess09/alas-launcher"><img src="https://img.shields.io/badge/Wiki-Ask%20DeepWiki-6366F1?style=flat-square" alt="Ask DeepWiki"></a>
-        <a href="https://github.com/wess09/alas-launcher/issues/new/choose"><img src="https://img.shields.io/badge/Issue-Report%20a%20Bug-d73a49?style=flat-square&logo=githubissues&logoColor=white" alt="New Issue"></a>
-        <a href="https://github.com/wess09/alas-launcher/pulls"><img src="https://img.shields.io/badge/PR-Contribute%20Code-28a745?style=flat-square&logo=git&logoColor=white" alt="Pull Request"></a>
-        <a href="https://github.com/wess09/alas-launcher/stargazers"><img src="https://img.shields.io/badge/Star-Support%20the%20Project-f5a623?style=flat-square&logo=github&logoColor=white" alt="Star"></a>
+        <a href="https://github.com/wess09/AzurPilotLauncher/releases/latest"><img src="https://img.shields.io/badge/Release-Download%20Latest-0052cc?style=flat-square&logo=github&logoColor=white" alt="Download"></a>
+        <a href="https://deepwiki.com/wess09/AzurPilotLauncher"><img src="https://img.shields.io/badge/Wiki-Ask%20DeepWiki-6366F1?style=flat-square" alt="Ask DeepWiki"></a>
+        <a href="https://github.com/wess09/AzurPilotLauncher/issues/new/choose"><img src="https://img.shields.io/badge/Issue-Report%20a%20Bug-d73a49?style=flat-square&logo=githubissues&logoColor=white" alt="New Issue"></a>
+        <a href="https://github.com/wess09/AzurPilotLauncher/pulls"><img src="https://img.shields.io/badge/PR-Contribute%20Code-28a745?style=flat-square&logo=git&logoColor=white" alt="Pull Request"></a>
+        <a href="https://github.com/wess09/AzurPilotLauncher/stargazers"><img src="https://img.shields.io/badge/Star-Support%20the%20Project-f5a623?style=flat-square&logo=github&logoColor=white" alt="Star"></a>
       </td>
     </tr>
   </tbody>
@@ -121,7 +121,7 @@ This project works closely with the following core projects in its ecosystem:
   <tr>
     <td width="33%" valign="top">
       <div align="center">
-        <a href="https://github.com/wess09/alas-launcher">
+        <a href="https://github.com/wess09/AzurPilotLauncher">
           <img src="https://img.shields.io/badge/Repository-AzurPilot%20Launcher-181717?style=for-the-badge&logo=github&logoColor=white" alt="AzurPilot Launcher">
         </a>
       </div>
@@ -335,7 +335,7 @@ graph TD
         <img src="https://img.shields.io/badge/Step-01-blue?style=flat-square" alt="Step 1"><br>
         <h4>Get the Archive</h4>
       </div>
-      Download the archive <b>matching your OS and CPU</b> (international or CN-mirror build) from the <a href="https://github.com/wess09/alas-launcher/releases/latest">latest release</a>.
+      Download the archive <b>matching your OS and CPU</b> (international or CN-mirror build) from the <a href="https://github.com/wess09/AzurPilotLauncher/releases/latest">latest release</a>.
     </td>
     <td width="25%" valign="top">
       <div align="center">
@@ -442,17 +442,17 @@ Environment variables appended by the launcher
     <tr>
       <td width="33%">
         <b>Commit Frequency</b><br>
-        <img src="https://img.shields.io/github/commit-activity/m/wess09/alas-launcher?style=flat-square&color=00d4aa" alt="Commit Activity"><br>
+        <img src="https://img.shields.io/github/commit-activity/m/wess09/AzurPilotLauncher?style=flat-square&color=00d4aa" alt="Commit Activity"><br>
         <small>Monthly commit activity</small>
       </td>
       <td width="33%">
         <b>Pull Requests</b><br>
-        <img src="https://img.shields.io/github/issues-pr-closed/wess09/alas-launcher?style=flat-square&color=6f42c1" alt="Closed PRs"><br>
+        <img src="https://img.shields.io/github/issues-pr-closed/wess09/AzurPilotLauncher?style=flat-square&color=6f42c1" alt="Closed PRs"><br>
         <small>Total closed pull requests</small>
       </td>
       <td width="33%">
         <b>Issues Resolved</b><br>
-        <img src="https://img.shields.io/github/issues-closed/wess09/alas-launcher?style=flat-square&color=28a745" alt="Closed Issues"><br>
+        <img src="https://img.shields.io/github/issues-closed/wess09/AzurPilotLauncher?style=flat-square&color=28a745" alt="Closed Issues"><br>
         <small>Total resolved issues</small>
       </td>
     </tr>
@@ -469,7 +469,7 @@ Environment variables appended by the launcher
       </td>
       <td width="33%">
         <b>Latest Commit</b><br>
-        <a href="https://github.com/wess09/alas-launcher/commits/main"><img src="https://img.shields.io/github/last-commit/wess09/alas-launcher?style=flat-square&color=586069" alt="Last Commit"></a><br>
+        <a href="https://github.com/wess09/AzurPilotLauncher/commits/main"><img src="https://img.shields.io/github/last-commit/wess09/AzurPilotLauncher?style=flat-square&color=586069" alt="Last Commit"></a><br>
         <small>Tracking the latest evolution</small>
       </td>
     </tr>
@@ -484,12 +484,12 @@ An adaptive light/dark Star-History chart reflecting the project's growth:
 
 <div align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=wess09/alas-launcher&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=wess09/alas-launcher&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=wess09/alas-launcher&type=Date" width="100%" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=wess09/AzurPilotLauncher&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=wess09/AzurPilotLauncher&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=wess09/AzurPilotLauncher&type=Date" width="100%" />
   </picture>
   <br>
-  <sub>Live data from <a href="https://star-history.com/#wess09/alas-launcher&Date">Star-History</a> · click for the interactive full chart</sub>
+  <sub>Live data from <a href="https://star-history.com/#wess09/AzurPilotLauncher&Date">Star-History</a> · click for the interactive full chart</sub>
 </div>
 
 ---
@@ -522,29 +522,29 @@ An adaptive light/dark Star-History chart reflecting the project's growth:
   <tr>
     <td width="50%" valign="top">
       <div align="center">
-        <a href="https://github.com/wess09/alas-launcher/graphs/contributors">
+        <a href="https://github.com/wess09/AzurPilotLauncher/graphs/contributors">
           <img src="https://img.shields.io/badge/Community-Contributors-blueviolet?style=for-the-badge&logo=github&logoColor=white" alt="Contributors">
         </a>
         <br><br>
         <h4>Open Source Collaboration</h4>
         <p>Thanks to every developer who has contributed code, improved the architecture, debugged issues or verified features. Feel free to open an Issue or PR to join in!</p>
-        <a href="https://github.com/wess09/alas-launcher/graphs/contributors">
+        <a href="https://github.com/wess09/AzurPilotLauncher/graphs/contributors">
           <img src="https://img.shields.io/badge/View%20Contributors-GitHub%20Graph-181717?style=flat-square&logo=github&logoColor=white" alt="View Contributors">
         </a>
-        <a href="https://github.com/wess09/alas-launcher/issues/new/choose">
+        <a href="https://github.com/wess09/AzurPilotLauncher/issues/new/choose">
           <img src="https://img.shields.io/badge/Give%20Feedback-New%20Issue-0052cc?style=flat-square&logo=githubissues&logoColor=white" alt="New Issue">
         </a>
       </div>
     </td>
     <td width="50%" valign="top">
       <div align="center">
-        <a href="https://github.com/wess09/alas-launcher/stargazers">
+        <a href="https://github.com/wess09/AzurPilotLauncher/stargazers">
           <img src="https://img.shields.io/badge/Project-Star%20History-f5a623?style=for-the-badge&logo=star&logoColor=white" alt="Star History">
         </a>
         <br><br>
         <h4>Growth &amp; Support</h4>
         <p>If this launcher makes your automated cruising smoother, please consider starring the repository to support its development.</p>
-        <a href="https://star-history.com/#wess09/alas-launcher&Date">
+        <a href="https://star-history.com/#wess09/AzurPilotLauncher&Date">
           <img src="https://img.shields.io/badge/Star%20Trends-Star--History-orange?style=flat-square" alt="Star History Link">
         </a>
       </div>
@@ -561,5 +561,5 @@ This project is open-sourced under the [GNU General Public License v3.0 (GPL-3.0
 ---
 
 <div align="center">
-  <sub>AzurPilot Launcher is open-source and community-driven. For any issues, feel free to open an <a href="https://github.com/wess09/alas-launcher/issues">Issue</a> or a <a href="https://github.com/wess09/alas-launcher/pulls">Pull Request</a>.</sub>
+  <sub>AzurPilot Launcher is open-source and community-driven. For any issues, feel free to open an <a href="https://github.com/wess09/AzurPilotLauncher/issues">Issue</a> or a <a href="https://github.com/wess09/AzurPilotLauncher/pulls">Pull Request</a>.</sub>
 </div>

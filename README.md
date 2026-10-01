@@ -33,17 +33,17 @@
   <img src="https://img.shields.io/badge/i18n-4%20Languages-blueviolet.svg?style=flat-square" alt="i18n: 4 Languages">
   <img src="https://img.shields.io/badge/Update-Git%20%2B%20uv%20Sync-brightgreen.svg?style=flat-square" alt="Update: Git + uv Sync">
   <img src="https://img.shields.io/badge/Self%20Update-mTLS%20Secured-orange.svg?style=flat-square" alt="Self Update: mTLS">
-  <a href="https://deepwiki.com/wess09/alas-launcher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
+  <a href="https://deepwiki.com/wess09/AzurPilotLauncher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
 </p>
 
 <!-- 仓库动态与社区指标标签组 -->
 <p align="center">
-  <a href="https://github.com/wess09/alas-launcher/releases/latest"><img src="https://img.shields.io/github/v/release/wess09/alas-launcher?style=flat-square&color=007ec6&label=Latest%20Release" alt="Latest Release"></a>
-  <a href="https://github.com/wess09/alas-launcher/releases"><img src="https://img.shields.io/github/downloads/wess09/alas-launcher/total?style=flat-square&color=28a745&label=Downloads" alt="Total Downloads"></a>
-  <a href="https://github.com/wess09/alas-launcher/stargazers"><img src="https://img.shields.io/github/stars/wess09/alas-launcher?style=flat-square&color=f5a623&label=Stars" alt="Stars"></a>
-  <a href="https://github.com/wess09/alas-launcher/network/members"><img src="https://img.shields.io/github/forks/wess09/alas-launcher?style=flat-square&color=6f42c1&label=Forks" alt="Forks"></a>
-  <a href="https://github.com/wess09/alas-launcher/issues"><img src="https://img.shields.io/github/issues/wess09/alas-launcher?style=flat-square&color=d73a49&label=Issues" alt="Open Issues"></a>
-  <a href="https://github.com/wess09/alas-launcher/commits/main"><img src="https://img.shields.io/github/last-commit/wess09/alas-launcher?style=flat-square&color=586069&label=Last%20Commit" alt="Last Commit"></a>
+  <a href="https://github.com/wess09/AzurPilotLauncher/releases/latest"><img src="https://img.shields.io/github/v/release/wess09/AzurPilotLauncher?style=flat-square&color=007ec6&label=Latest%20Release" alt="Latest Release"></a>
+  <a href="https://github.com/wess09/AzurPilotLauncher/releases"><img src="https://img.shields.io/github/downloads/wess09/AzurPilotLauncher/total?style=flat-square&color=28a745&label=Downloads" alt="Total Downloads"></a>
+  <a href="https://github.com/wess09/AzurPilotLauncher/stargazers"><img src="https://img.shields.io/github/stars/wess09/AzurPilotLauncher?style=flat-square&color=f5a623&label=Stars" alt="Stars"></a>
+  <a href="https://github.com/wess09/AzurPilotLauncher/network/members"><img src="https://img.shields.io/github/forks/wess09/AzurPilotLauncher?style=flat-square&color=6f42c1&label=Forks" alt="Forks"></a>
+  <a href="https://github.com/wess09/AzurPilotLauncher/issues"><img src="https://img.shields.io/github/issues/wess09/AzurPilotLauncher?style=flat-square&color=d73a49&label=Issues" alt="Open Issues"></a>
+  <a href="https://github.com/wess09/AzurPilotLauncher/commits/main"><img src="https://img.shields.io/github/last-commit/wess09/AzurPilotLauncher?style=flat-square&color=586069&label=Last%20Commit" alt="Last Commit"></a>
 </p>
 
 <p align="center">
@@ -79,13 +79,13 @@
   </thead>
   <tbody>
     <tr>
-      <td width="25%"><b>最新正式版</b><br><a href="https://github.com/wess09/alas-launcher/releases/latest"><img src="https://img.shields.io/github/v/release/wess09/alas-launcher?style=flat-square&color=007ec6" alt="Release"></a></td>
-      <td width="25%"><b>累计下载量</b><br><a href="https://github.com/wess09/alas-launcher/releases"><img src="https://img.shields.io/github/downloads/wess09/alas-launcher/total?style=flat-square&color=28a745" alt="Downloads"></a></td>
+      <td width="25%"><b>最新正式版</b><br><a href="https://github.com/wess09/AzurPilotLauncher/releases/latest"><img src="https://img.shields.io/github/v/release/wess09/AzurPilotLauncher?style=flat-square&color=007ec6" alt="Release"></a></td>
+      <td width="25%"><b>累计下载量</b><br><a href="https://github.com/wess09/AzurPilotLauncher/releases"><img src="https://img.shields.io/github/downloads/wess09/AzurPilotLauncher/total?style=flat-square&color=28a745" alt="Downloads"></a></td>
       <td width="25%"><b>开源许可证</b><br><a href="./LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="GPL-3.0"></a></td>
-      <td width="25%"><b>自动化构建</b><br><a href="https://github.com/wess09/alas-launcher/actions"><img src="https://img.shields.io/badge/CI-GitHub%20Actions-2088FF?style=flat-square&logo=githubactions&logoColor=white" alt="CI Status"></a></td>
+      <td width="25%"><b>自动化构建</b><br><a href="https://github.com/wess09/AzurPilotLauncher/actions"><img src="https://img.shields.io/badge/CI-GitHub%20Actions-2088FF?style=flat-square&logo=githubactions&logoColor=white" alt="CI Status"></a></td>
     </tr>
     <tr>
-      <td width="25%"><b>代码库体积</b><br><img src="https://img.shields.io/github/repo-size/wess09/alas-launcher?style=flat-square&color=586069" alt="Repo Size"></td>
+      <td width="25%"><b>代码库体积</b><br><img src="https://img.shields.io/github/repo-size/wess09/AzurPilotLauncher?style=flat-square&color=586069" alt="Repo Size"></td>
       <td width="25%"><b>代码语言</b><br><img src="https://img.shields.io/badge/Language-Rust%20%7C%20Tauri-DEA584?style=flat-square&logo=rust&logoColor=white" alt="Language"></td>
       <td width="25%"><b>运行时</b><br><img src="https://img.shields.io/badge/Python-3.14.6%20%2B%20uv-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python Runtime"></td>
       <td width="25%"><b>界面语言</b><br><img src="https://img.shields.io/badge/i18n-%E7%AE%80%E4%BD%93%20%7C%20%E7%B9%81%E9%AB%94%20%7C%20%E6%97%A5%E6%9C%AC%E8%AA%9E%20%7C%20En-blueviolet?style=flat-square" alt="i18n"></td>
@@ -93,11 +93,11 @@
     <tr>
       <td colspan="4">
         <b>快速操作快捷入口：</b>
-        <a href="https://github.com/wess09/alas-launcher/releases/latest"><img src="https://img.shields.io/badge/Release-下载最新压缩包-0052cc?style=flat-square&logo=github&logoColor=white" alt="Download"></a>
-        <a href="https://deepwiki.com/wess09/alas-launcher"><img src="https://img.shields.io/badge/Wiki-Ask%20DeepWiki-6366F1?style=flat-square" alt="Ask DeepWiki"></a>
-        <a href="https://github.com/wess09/alas-launcher/issues/new/choose"><img src="https://img.shields.io/badge/Issue-提交错误报告与需求-d73a49?style=flat-square&logo=githubissues&logoColor=white" alt="New Issue"></a>
-        <a href="https://github.com/wess09/alas-launcher/pulls"><img src="https://img.shields.io/badge/PR-合并请求代码贡献-28a745?style=flat-square&logo=git&logoColor=white" alt="Pull Request"></a>
-        <a href="https://github.com/wess09/alas-launcher/stargazers"><img src="https://img.shields.io/badge/Star-关注项目发展-f5a623?style=flat-square&logo=github&logoColor=white" alt="Star"></a>
+        <a href="https://github.com/wess09/AzurPilotLauncher/releases/latest"><img src="https://img.shields.io/badge/Release-下载最新压缩包-0052cc?style=flat-square&logo=github&logoColor=white" alt="Download"></a>
+        <a href="https://deepwiki.com/wess09/AzurPilotLauncher"><img src="https://img.shields.io/badge/Wiki-Ask%20DeepWiki-6366F1?style=flat-square" alt="Ask DeepWiki"></a>
+        <a href="https://github.com/wess09/AzurPilotLauncher/issues/new/choose"><img src="https://img.shields.io/badge/Issue-提交错误报告与需求-d73a49?style=flat-square&logo=githubissues&logoColor=white" alt="New Issue"></a>
+        <a href="https://github.com/wess09/AzurPilotLauncher/pulls"><img src="https://img.shields.io/badge/PR-合并请求代码贡献-28a745?style=flat-square&logo=git&logoColor=white" alt="Pull Request"></a>
+        <a href="https://github.com/wess09/AzurPilotLauncher/stargazers"><img src="https://img.shields.io/badge/Star-关注项目发展-f5a623?style=flat-square&logo=github&logoColor=white" alt="Star"></a>
       </td>
     </tr>
   </tbody>
@@ -121,7 +121,7 @@
   <tr>
     <td width="33%" valign="top">
       <div align="center">
-        <a href="https://github.com/wess09/alas-launcher">
+        <a href="https://github.com/wess09/AzurPilotLauncher">
           <img src="https://img.shields.io/badge/Repository-AzurPilot%20Launcher-181717?style=for-the-badge&logo=github&logoColor=white" alt="AzurPilot Launcher">
         </a>
       </div>
@@ -335,7 +335,7 @@ graph TD
         <img src="https://img.shields.io/badge/步骤-01-blue?style=flat-square" alt="Step 1"><br>
         <h4>获取压缩包</h4>
       </div>
-      前往 <a href="https://github.com/wess09/alas-launcher/releases/latest">Releases 最新版本</a> 下载<b>对应系统与 CPU 的压缩包</b>（国际版或 CN 镜像版）。
+      前往 <a href="https://github.com/wess09/AzurPilotLauncher/releases/latest">Releases 最新版本</a> 下载<b>对应系统与 CPU 的压缩包</b>（国际版或 CN 镜像版）。
     </td>
     <td width="25%" valign="top">
       <div align="center">
@@ -442,17 +442,17 @@ Adb
     <tr>
       <td width="33%">
         <b>代码提交频度</b><br>
-        <img src="https://img.shields.io/github/commit-activity/m/wess09/alas-launcher?style=flat-square&color=00d4aa" alt="Commit Activity"><br>
+        <img src="https://img.shields.io/github/commit-activity/m/wess09/AzurPilotLauncher?style=flat-square&color=00d4aa" alt="Commit Activity"><br>
         <small>月度提交活跃状态</small>
       </td>
       <td width="33%">
         <b>合并请求处理</b><br>
-        <img src="https://img.shields.io/github/issues-pr-closed/wess09/alas-launcher?style=flat-square&color=6f42c1" alt="Closed PRs"><br>
+        <img src="https://img.shields.io/github/issues-pr-closed/wess09/AzurPilotLauncher?style=flat-square&color=6f42c1" alt="Closed PRs"><br>
         <small>已归档合并请求总计</small>
       </td>
       <td width="33%">
         <b>问题反馈解决</b><br>
-        <img src="https://img.shields.io/github/issues-closed/wess09/alas-launcher?style=flat-square&color=28a745" alt="Closed Issues"><br>
+        <img src="https://img.shields.io/github/issues-closed/wess09/AzurPilotLauncher?style=flat-square&color=28a745" alt="Closed Issues"><br>
         <small>已成功解决 Issue 统计</small>
       </td>
     </tr>
@@ -469,7 +469,7 @@ Adb
       </td>
       <td width="33%">
         <b>最新提交记录</b><br>
-        <a href="https://github.com/wess09/alas-launcher/commits/main"><img src="https://img.shields.io/github/last-commit/wess09/alas-launcher?style=flat-square&color=586069" alt="Last Commit"></a><br>
+        <a href="https://github.com/wess09/AzurPilotLauncher/commits/main"><img src="https://img.shields.io/github/last-commit/wess09/AzurPilotLauncher?style=flat-square&color=586069" alt="Last Commit"></a><br>
         <small>追踪最新代码演进</small>
       </td>
     </tr>
@@ -484,12 +484,12 @@ Adb
 
 <div align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=wess09/alas-launcher&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=wess09/alas-launcher&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=wess09/alas-launcher&type=Date" width="100%" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=wess09/AzurPilotLauncher&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=wess09/AzurPilotLauncher&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=wess09/AzurPilotLauncher&type=Date" width="100%" />
   </picture>
   <br>
-  <sub>数据源基于 <a href="https://star-history.com/#wess09/alas-launcher&Date">Star-History</a> 实时更新 · 点击可查看交互式完整走势</sub>
+  <sub>数据源基于 <a href="https://star-history.com/#wess09/AzurPilotLauncher&Date">Star-History</a> 实时更新 · 点击可查看交互式完整走势</sub>
 </div>
 
 ---
@@ -522,29 +522,29 @@ Adb
   <tr>
     <td width="50%" valign="top">
       <div align="center">
-        <a href="https://github.com/wess09/alas-launcher/graphs/contributors">
+        <a href="https://github.com/wess09/AzurPilotLauncher/graphs/contributors">
           <img src="https://img.shields.io/badge/Community-Contributors-blueviolet?style=for-the-badge&logo=github&logoColor=white" alt="Contributors">
         </a>
         <br><br>
         <h4>开源共建与参与</h4>
         <p>感谢所有参与代码提交、架构改进、问题排查与功能验证的开发者。欢迎随时提交 Issue 与 PR 参与共建！</p>
-        <a href="https://github.com/wess09/alas-launcher/graphs/contributors">
+        <a href="https://github.com/wess09/AzurPilotLauncher/graphs/contributors">
           <img src="https://img.shields.io/badge/查看完整贡献名单-GitHub%20Graph-181717?style=flat-square&logo=github&logoColor=white" alt="View Contributors">
         </a>
-        <a href="https://github.com/wess09/alas-launcher/issues/new/choose">
+        <a href="https://github.com/wess09/AzurPilotLauncher/issues/new/choose">
           <img src="https://img.shields.io/badge/提交反馈-New%20Issue-0052cc?style=flat-square&logo=githubissues&logoColor=white" alt="New Issue">
         </a>
       </div>
     </td>
     <td width="50%" valign="top">
       <div align="center">
-        <a href="https://github.com/wess09/alas-launcher/stargazers">
+        <a href="https://github.com/wess09/AzurPilotLauncher/stargazers">
           <img src="https://img.shields.io/badge/Project-Star%20History-f5a623?style=for-the-badge&logo=star&logoColor=white" alt="Star History">
         </a>
         <br><br>
         <h4>项目成长与支持</h4>
         <p>如果本启动器为你的挂机体验带来了便利，欢迎前往仓库主页点亮 Star 支持项目演进。</p>
-        <a href="https://star-history.com/#wess09/alas-launcher&Date">
+        <a href="https://star-history.com/#wess09/AzurPilotLauncher&Date">
           <img src="https://img.shields.io/badge/Star%20趋势看板-Star--History-orange?style=flat-square" alt="Star History Link">
         </a>
       </div>
@@ -561,5 +561,5 @@ Adb
 ---
 
 <div align="center">
-  <sub>AzurPilot Launcher 遵守开源协议并由社区驱动维护。如遇问题欢迎提交 <a href="https://github.com/wess09/alas-launcher/issues">Issue</a> 或 <a href="https://github.com/wess09/alas-launcher/pulls">Pull Request</a>。</sub>
+  <sub>AzurPilot Launcher 遵守开源协议并由社区驱动维护。如遇问题欢迎提交 <a href="https://github.com/wess09/AzurPilotLauncher/issues">Issue</a> 或 <a href="https://github.com/wess09/AzurPilotLauncher/pulls">Pull Request</a>。</sub>
 </div>
