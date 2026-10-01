@@ -1,13 +1,41 @@
-// No default console window createion on Windows
+//! AzurPilot Launcher——AzurLaneAutoScript（碧蓝航线自动化脚本）的跨平台
+//! （Windows/macOS/Linux）桌面启动器，Tauri 2 + Rust。本文件是应用入口，
+//! 承担窗口管理（splash 启动画面 + 主窗口）、系统托盘、启动器自更新、
+//! 时间炸弹与后端 ManagedBackend 的生命周期衔接。
+//!
+//! 启动流程概览：初始化日志（log/{日期}_launcher.txt）→ splash 窗口 →
+//! 后台线程依次完成启动器自更新检查、setup_alas_repo 仓库环境准备、
+//! ManagedBackend 启动 gui.py → SSE 通知流与反向控制流就绪后销毁 splash
+//! 并把主窗口导航到 WebUI（默认端口 22267）。
+//!
+//! 关键机制：
+//! - 自定义 URI 协议：alas-splash:// 提供启动画面页面，alas-error:// 提供
+//!   后端连接失败的错误页面（Windows 上以 http://*.localhost 假域名实现）；
+//! - 标题栏 JS 注入（page_load_injector）：注入红绿灯窗口按钮与拖拽区、
+//!   覆盖 window.saveAs 改走 Tauri save_as 命令、阻止浏览器后退；
+//! - 时间炸弹：运行时从内嵌 Cargo.toml 解析过期配置，经 HTTP Date 头获取
+//!   网络时间比对，过期则弹窗并阻止启动；
+//! - 三平台关闭行为：Windows 弹出窗口内"退出/最小化到托盘"选择菜单，
+//!   macOS 最小化到托盘并隐藏 Dock 图标，Linux 直接隐藏窗口。
+
+// 在 Windows 上不创建默认控制台窗口
 #![windows_subsystem = "windows"]
 
+/// 开机自启动管理。
 mod autostart;
+/// gui.py 后端子进程的托管（启动、就绪探测、终止等）。
 mod backend;
+/// 多语言（i18n）初始化与本地化支持。
 mod i18n;
+/// 启动器反向控制流：接收后端经 SSE 下发的退出等指令。
 mod launcher_control;
+/// Windows 运行时 Node.js 的检测与安装引导。
 mod nodejs;
+/// SSE 通知流：接收后端推送的系统通知与点击回调。
 mod notify;
+/// 首次启动环境准备（deploy.yaml、仓库克隆/更新、依赖同步）。
 mod setup;
+/// 窗口工具（控制台附着状态等平台辅助）。
 mod window_util;
 
 #[macro_use]
@@ -68,44 +96,78 @@ use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
+/// macOS 托盘图标（2x 分辨率 PNG）：Retina 屏幕菜单栏使用的高清版本。
 #[cfg(target_os = "macos")]
 const MENUBAR_ICON_2X: &[u8] = include_bytes!("../icons/menubar@2x.png");
+/// macOS 托盘图标（1x 分辨率 PNG）：2x 图标解码失败时的降级备选。
 #[cfg(target_os = "macos")]
 const MENUBAR_ICON_1X: &[u8] = include_bytes!("../icons/menubar.png");
+/// Windows 系统托盘图标（PNG）。使用内嵌字节而非文件路径，保证打包后
+/// 即使资源缺失托盘图标也能正常加载。
 #[cfg(windows)]
 const WINDOWS_TRAY_ICON: &[u8] = include_bytes!("../icons/icon.png");
+/// splash 启动画面背景视频（MP4），base64 内嵌进 alas-splash:// 页面。
 const SPLASH_BG_VIDEO: &[u8] = include_bytes!("../bg/bg.mp4");
+/// 进度条上的"进度头"装饰图（WebP），随进度百分比横向移动。
 const SPLASH_PROGRESS_HEAD: &[u8] = include_bytes!("../bg/loading.webp");
+/// 内嵌 MiSans 启动器字体（TTF），供 splash 与错误页面内联 @font-face 使用。
 const MI_SANS_FONT: &[u8] = include_bytes!("../fonts/MiSansLauncher.ttf");
+/// 后端端口探测的单次 TCP 连接超时：只做快速可达性判断，不宜过长。
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+/// 主窗口导航前等待后端就绪的总时限，超时后转入错误页面。
 const BACKEND_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// 错误页面地址基路径。Windows/Android 的 WebView 通过
+/// http://<协议>.localhost 假域名实现自定义协议，故走 http 变体。
 #[cfg(any(windows, target_os = "android"))]
 const BACKEND_ERROR_URL_BASE: &str = "http://alas-error.localhost/backend";
+/// 错误页面地址基路径的通用变体：直接使用自定义 alas-error:// 协议。
 #[cfg(not(any(windows, target_os = "android")))]
 const BACKEND_ERROR_URL_BASE: &str = "alas-error://localhost/backend";
+/// splash 页面地址基路径（Windows/Android 走 http 假域名变体，原因同上）。
 #[cfg(any(windows, target_os = "android"))]
 const SPLASH_URL: &str = "http://alas-splash.localhost/";
+/// splash 页面地址基路径的通用变体：自定义 alas-splash:// 协议。
 #[cfg(not(any(windows, target_os = "android")))]
 const SPLASH_URL: &str = "alas-splash://localhost/";
+/// 时间炸弹配置源：编译期内嵌的 Cargo.toml 文本，运行时从中解析
+/// package.metadata.alas-launcher.time-bomb 段，免于新增独立配置文件。
 const TIME_BOMB_CONFIG_SOURCE: &str = include_str!("../Cargo.toml");
+/// 测试专用的 tauri.conf.json 内嵌文本，用于校验 WebView 拖拽相关配置。
 #[cfg(test)]
 const TAURI_CONFIG_SOURCE: &str = include_str!("../tauri.conf.json");
+/// 启动器更新清单主 URL：编译期由构建脚本经环境变量注入。
 const LAUNCHER_UPDATE_URL: &str = env!("LAUNCHER_UPDATE_URL");
+/// 主 URL 不可用时的更新清单回退 URL。
 const LAUNCHER_UPDATE_FALLBACK_URL: &str =
     "https://ap.launcher-update.nanoda.work/updata/stable.json";
+/// 存在该环境变量时跳过启动器更新检查（自更新重启后的新一轮启动会带上）。
 const LAUNCHER_UPDATE_SKIP_ENV: &str = "AZURPILOT_SKIP_LAUNCHER_UPDATE";
+/// 迷你版启动器的版本号：迷你版即使已是"最新"也必须升级到正式版。
 const MINI_LAUNCHER_VERSION: &str = "0.0.1";
+/// 下载更新载荷所需的 mTLS 客户端身份（PEM），构建脚本生成后内嵌；
+/// 空内容表示未配置 mTLS。
 const LAUNCHER_UPDATE_MTLS_IDENTITY: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/launcher_mtls_identity.pem"));
+/// 更新请求使用的浏览器 User-Agent，附带 AZURPILOT_LAUNCHER_UPDATE 标识
+/// 便于服务端识别流量来源。
 const LAUNCHER_UPDATE_BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 AZURPILOT_LAUNCHER_UPDATE/2.0.4";
+/// 并行下载更新载荷的最大连接数。
 const LAUNCHER_UPDATE_MAX_CONNECTIONS: usize = 8;
+/// 并行分片的最小字节数：载荷不足单片时退回单连接顺序下载。
 const LAUNCHER_UPDATE_MIN_CHUNK_BYTES: u64 = 1024 * 1024;
+/// 更新下载占用 splash 进度条的起始百分比（8 之前留给更新前的检查）。
 const LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START: u8 = 8;
+/// 更新下载占用 splash 进度条的结束百分比（88 之后留给校验与重启）。
 const LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END: u8 = 88;
+/// Windows 专用：存在该环境变量表示当前进程由更新助手拉起，启动时不
+/// 附着父进程控制台（读取后立即删除，避免传递给子进程）。
 #[cfg(windows)]
 const LAUNCHER_UPDATE_NO_CONSOLE_ENV: &str = "AZURPILOT_NO_ATTACH_CONSOLE";
+/// Windows 专用：更新助手模式的命令行标记，后跟目标 exe 路径与载荷路径。
 #[cfg(windows)]
 const LAUNCHER_UPDATE_APPLY_ARG: &str = "--apply-launcher-update";
+/// 预览"跳过更新检查"模式的命令行参数：横线与斜杠两种风格都接受，
+/// 便于测试时模拟"无更新可用"的启动路径。
 const PREVIEW_NO_UPDATE_ARGS: &[&str] = &[
     "--preview-no-update",
     "--skip-update",
@@ -115,6 +177,7 @@ const PREVIEW_NO_UPDATE_ARGS: &[&str] = &[
     "/skip-update",
     "/no-update",
 ];
+/// 预览"启动即报错"模式的命令行参数，用于测试 splash 错误态的展示效果。
 const PREVIEW_CRASH_ARGS: &[&str] = &[
     "--preview-crash",
     "--preview-error",
@@ -123,6 +186,7 @@ const PREVIEW_CRASH_ARGS: &[&str] = &[
     "/preview-crash",
     "/preview-error",
 ];
+/// 请求"启动后最小化到托盘"的命令行参数。
 const START_MINIMIZED_ARGS: &[&str] = &["--start-minimized", "/start-minimized"];
 
 // ---------------------------------------------------------------------------
@@ -134,10 +198,14 @@ const START_MINIMIZED_ARGS: &[&str] = &["--start-minimized", "/start-minimized"]
 // 预置登录态实现免密。信任密钥与会话密钥解耦，其它浏览器仍走原密码门禁。
 // 手动 gui.py 启动时密钥未注入，WebUI 端整体关闭该通道。
 // ---------------------------------------------------------------------------
+/// 注入 gui.py 子进程的免密信任密钥所用的环境变量名。
 pub(crate) const TRUST_SECRET_ENV: &str = "ALAS_WEBUI_TRUST_SECRET";
+/// 信任密钥的原始随机字节数（base64 编码后约 32 字符）。
 const TRUST_SECRET_LENGTH: usize = 24;
+/// 换发免密令牌的请求超时：失败即回退普通登录页，不能拖慢主窗口展示。
 const TRUST_LOGIN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// 本次会话的信任密钥缓存：首次调用时生成并全程复用，进程结束即失效。
 static LAUNCHER_TRUST_SECRET: OnceLock<String> = OnceLock::new();
 
 /// 生成（首次）并返回本次会话的启动器信任密钥。
@@ -205,33 +273,55 @@ fn redacted_url_log(url: &Url) -> String {
     out
 }
 
+/// Tauri 托管状态：包装"允许退出"标志，供 window_exit_application 命令置位，
+/// 使 RunEvent::ExitRequested 分支放行真正的进程退出。
 struct ExitControl(Arc<AtomicBool>);
 
+/// 时间炸弹配置：到期时间、网络时间来源 URL 与过期提示文案。
+///
+/// 由 Cargo.toml 的 package.metadata.alas-launcher.time-bomb 段解析而来；
+/// 未启用时间炸弹时整体缺省（None）。
 #[derive(Clone, Debug)]
 struct TimeBombConfig {
+    /// 到期时间：RFC 3339 解析为带固定时区的时间，网络时间不早于该值即过期。
     expires_at: DateTime<FixedOffset>,
+    /// 用于获取"可信当前时间"的 URL，取其 HTTP Date 响应头判断。
     network_time_url: String,
+    /// 过期后弹窗展示的提示文案。
     message: String,
 }
 
+/// 启动器更新清单：最新版本号与各平台的下载载荷描述。
 #[derive(Debug, Deserialize)]
 struct LauncherUpdateManifest {
+    /// 清单声明的最新启动器版本。
     version: String,
+    /// 平台标识（如 windows-x86_64）到对应载荷的映射。
     platforms: HashMap<String, LauncherUpdatePlatform>,
 }
 
+/// 单个平台的更新载荷信息。
 #[derive(Debug, Deserialize)]
 struct LauncherUpdatePlatform {
+    /// 载荷下载 URL（清单公开，载荷本身需 mTLS）。
     url: String,
+    /// 载荷的 SHA-256 十六进制摘要，下载后用于完整性校验。
     sha256: String,
 }
 
+/// 并行下载的一个字节区间（闭区间 [start, end]）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LauncherUpdateByteRange {
+    /// 区间起始字节偏移（含）。
     start: u64,
+    /// 区间结束字节偏移（含）。
     end: u64,
 }
 
+/// 加载 macOS 托盘图标：优先 2x 高清版，失败则降级 1x。
+///
+/// # Panics
+/// 两个内嵌图标字节均无法解码时 panic——没有图标时托盘无法创建。
 #[cfg(target_os = "macos")]
 fn tray_icon_for_platform() -> Image<'static> {
     info!("Loading macOS tray icon from embedded bytes...");
@@ -251,6 +341,10 @@ fn tray_icon_for_platform() -> Image<'static> {
     result
 }
 
+/// 加载 Windows 托盘图标（从内嵌 PNG 字节解码）。
+///
+/// # Panics
+/// 图标字节解码失败时 panic——没有图标时托盘无法创建。
 #[cfg(windows)]
 fn tray_icon_for_platform() -> Image<'static> {
     Image::from_bytes(WINDOWS_TRAY_ICON).unwrap_or_else(|err| {
@@ -259,6 +353,11 @@ fn tray_icon_for_platform() -> Image<'static> {
     })
 }
 
+/// 启动中断后的清理入口：提示用户、等待 setup 线程停止后重置 venv 并退出。
+///
+/// 多个退出路径（ExitRequested、splash 关闭）都可能触发，通过
+/// startup_cleanup_started 原子标志保证只执行一次。清理成功后置 allow_exit
+/// 并以退出码 0 结束应用；失败则在 splash 上显示错误并复位标志，允许重试。
 fn begin_startup_cleanup(
     app_handle: tauri::AppHandle,
     allow_exit: Arc<AtomicBool>,
@@ -266,6 +365,7 @@ fn begin_startup_cleanup(
     setup_running: Arc<AtomicBool>,
     startup_cleanup_started: Arc<AtomicBool>,
 ) {
+    // 幂等保护：清理只允许触发一次，后续并发的退出请求直接忽略。
     if startup_cleanup_started
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -273,6 +373,7 @@ fn begin_startup_cleanup(
         return;
     }
 
+    // 通知 setup 线程尽早取消，避免清理与初始化并发改写环境。
     setup_cancel_requested.store(true, Ordering::SeqCst);
     if let Some(splash) = app_handle.get_webview_window("splash") {
         update_splash(
@@ -286,12 +387,14 @@ fn begin_startup_cleanup(
         );
     }
 
+    // 弹出说明对话框告知用户"正在清理环境"，此弹窗不阻塞主流程。
     app_handle
         .dialog()
         .message(t!("dialog.cleaning_message"))
         .title(t!("dialog.cleaning_env"))
         .show(|_| {});
 
+    // 后台线程执行清理：先等 setup 线程退出（至多 30 秒，100ms 轮询）。
     thread::spawn(move || {
         let started_at = Instant::now();
         while setup_running.load(Ordering::SeqCst) && started_at.elapsed() < Duration::from_secs(30)
@@ -299,10 +402,12 @@ fn begin_startup_cleanup(
             thread::sleep(Duration::from_millis(100));
         }
 
+        // 超时仍未退出则记录告警，但继续清理，尽快让进程结束。
         if setup_running.load(Ordering::SeqCst) {
             warn!("Setup thread did not stop before startup cleanup timeout");
         }
 
+        // 重置 venv：下次启动时重新同步依赖，修复可能损坏的运行环境。
         match reset_venv_for_rebuild() {
             Ok(()) => {
                 info!("Startup cleanup finished; runtime will be rebuilt on next launch");
@@ -319,20 +424,28 @@ fn begin_startup_cleanup(
                         ),
                     );
                 }
+                // 清理失败：复位标志允许再次触发，不放行退出。
                 startup_cleanup_started.store(false, Ordering::SeqCst);
                 return;
             }
         }
 
+        // 清理完成后放行退出并结束进程。
         allow_exit.store(true, Ordering::SeqCst);
         app_handle.exit(0);
     });
 }
 
+/// 从内嵌 Cargo.toml 解析时间炸弹配置。
+///
+/// # Errors
+/// 配置段声明 enabled 但缺少 expires-at，或时间格式不是合法 RFC 3339 时
+/// 返回 Err；未启用或没有配置段时返回 Ok(None)。
 fn time_bomb_config() -> Result<Option<TimeBombConfig>> {
     let Some(section) = cargo_toml_section("package.metadata.alas-launcher.time-bomb") else {
         return Ok(None);
     };
+    // enabled 字段缺省按 false 处理：解析不到就当作未启用时间炸弹。
     let enabled = cargo_toml_value(section, "enabled")
         .and_then(|value| value.parse::<bool>().ok())
         .unwrap_or(false);
@@ -344,6 +457,7 @@ fn time_bomb_config() -> Result<Option<TimeBombConfig>> {
         .ok_or_else(|| anyhow!(t!("errors.time_bomb_not_configured")))?;
     let expires_at = DateTime::parse_from_rfc3339(&expires_at)
         .map_err(|err| anyhow!(t!("errors.time_bomb_format_error", error = err.to_string())))?;
+    // network-time-url 与 message 均有内置默认值，缺省也能工作。
     let network_time_url = cargo_toml_value(section, "network-time-url")
         .unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_owned());
     let message = cargo_toml_value(section, "message")
@@ -356,6 +470,10 @@ fn time_bomb_config() -> Result<Option<TimeBombConfig>> {
     }))
 }
 
+/// 在内嵌 Cargo.toml 文本中定位 `[section_name]` 段，返回段体文本
+/// （到下一个段头或文件末尾为止）。找不到段时返回 None。
+///
+/// 采用手写查找而非完整 TOML 库：仅需读取一个已知段，避免额外依赖。
 fn cargo_toml_section(section_name: &str) -> Option<&'static str> {
     let header = format!("[{section_name}]");
     let start = TIME_BOMB_CONFIG_SOURCE.find(&header)? + header.len();
@@ -364,6 +482,9 @@ fn cargo_toml_section(section_name: &str) -> Option<&'static str> {
     Some(&rest[..end])
 }
 
+/// 在 TOML 段文本中按行查找 `key = value`，返回去掉两侧引号后的字符串值。
+///
+/// 只处理单行简单键值：`#` 之后视为注释；找不到 key 时返回 None。
 fn cargo_toml_value(section: &str, key: &str) -> Option<String> {
     for line in section.lines() {
         let line = line
@@ -389,6 +510,13 @@ fn cargo_toml_value(section: &str, key: &str) -> Option<String> {
     None
 }
 
+/// 判断时间炸弹是否已过期。
+///
+/// # Returns
+/// 已过期返回 Some(配置的提示文案)；未配置或未过期返回 Ok(None)。
+///
+/// # Errors
+/// 配置解析或网络时间获取失败时返回 Err（调用方会告警并放行启动）。
 fn time_bomb_expiration_message() -> Result<Option<String>> {
     let Some(config) = time_bomb_config()? else {
         return Ok(None);
@@ -401,7 +529,16 @@ fn time_bomb_expiration_message() -> Result<Option<String>> {
     }
 }
 
+/// 从指定 URL 的 HTTP Date 响应头获取"可信"网络时间。
+///
+/// 直接读取响应头而非解析响应体，可复用任意轻量端点（如 gstatic 的
+/// generate_204），无需依赖专门的授时服务。
+///
+/// # Errors
+/// 请求失败、响应缺少 Date 头或 Date 头不是合法 RFC 2822 时间时返回 Err。
 fn fetch_network_time(url: &str) -> Result<DateTime<Utc>> {
+    // 5 秒超时并禁用系统代理：取的是响应头时间，必须直连目标服务器，
+    // 避免代理故障拖慢启动或干扰结果。
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .no_proxy()
@@ -415,6 +552,8 @@ fn fetch_network_time(url: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc2822(date_header)?.with_timezone(&Utc))
 }
 
+/// 构造更新请求的公共 HTTP 头：伪装成 Chrome 浏览器并附带语言偏好，
+/// 以通过 CDN/网关的默认访问规则。
 fn launcher_update_browser_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -432,17 +571,24 @@ fn launcher_update_browser_headers() -> HeaderMap {
     headers
 }
 
+/// 构造启动器更新专用的 reqwest 阻塞客户端。
+///
+/// # Errors
+/// 客户端构建失败（如 mTLS 身份解析出错）时返回 Err。
 fn launcher_update_http_client(
     timeout: Option<Duration>,
     with_mtls_identity: bool,
 ) -> Result<Client> {
+    // 15 秒连接超时兜底；整体超时由调用方按用途传入。
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .no_proxy()
         .default_headers(launcher_update_browser_headers());
+    // 仅请求更新载荷时携带 mTLS 身份；清单是公开数据，无需证书。
     if with_mtls_identity && !LAUNCHER_UPDATE_MTLS_IDENTITY.is_empty() {
         builder = builder.identity(reqwest::Identity::from_pem(LAUNCHER_UPDATE_MTLS_IDENTITY)?);
     }
+    // 传 None 表示不限整体超时（大文件下载按块读取，不能设死总时长）。
     builder = match timeout {
         Some(timeout) => builder.timeout(timeout),
         None => builder.timeout(None),
@@ -450,6 +596,10 @@ fn launcher_update_http_client(
     Ok(builder.build()?)
 }
 
+/// 拉取启动器更新清单：先试主 URL，失败后回退备用 URL。
+///
+/// # Errors
+/// 所有 URL 均失败时返回 Err。
 fn fetch_launcher_update_manifest(client: &Client) -> Result<LauncherUpdateManifest> {
     fetch_launcher_update_manifest_from_urls(
         client,
@@ -457,6 +607,11 @@ fn fetch_launcher_update_manifest(client: &Client) -> Result<LauncherUpdateManif
     )
 }
 
+/// 依次尝试给定的清单 URL 列表，取第一个成功的结果。
+///
+/// # Errors
+/// 全部 URL 都失败时返回 Err，错误信息累积了各 URL 的失败详情，便于
+/// 同时排查主/备两个源的问题。
 fn fetch_launcher_update_manifest_from_urls(
     client: &Client,
     urls: &[&str],
@@ -464,6 +619,7 @@ fn fetch_launcher_update_manifest_from_urls(
     let mut failures = Vec::new();
 
     for (index, url) in urls.iter().enumerate() {
+        // 跳过重复 URL（主备地址可能配置成同一个）。
         if urls[..index].iter().any(|previous| previous == url) {
             continue;
         }
@@ -488,6 +644,10 @@ fn fetch_launcher_update_manifest_from_urls(
     )
 }
 
+/// 从单个 URL 拉取并解析启动器更新清单 JSON。
+///
+/// # Errors
+/// 请求失败、非 2xx 状态、读取响应体或 JSON 解析任一步失败时返回 Err。
 fn fetch_launcher_update_manifest_from_url(
     client: &Client,
     url: &str,
@@ -504,17 +664,28 @@ fn fetch_launcher_update_manifest_from_url(
         .with_context(|| format!("parse launcher update manifest from {url}"))
 }
 
+/// 判断给定版本号是否为迷你版启动器（仅版本 0.0.1，忽略 v 前缀）。
 fn launcher_version_is_mini(version: &str) -> bool {
     version.strip_prefix('v').unwrap_or(version) == MINI_LAUNCHER_VERSION
 }
 
+/// 检查启动器自更新；发现新版本时下载、校验、替换自身并重启进程。
+///
+/// 进度经 status_updater 回调推送到 splash 进度条。返回 Ok(true) 表示已
+/// 拉起新版本进程（原进程应尽快退出交棒）；Ok(false) 表示已是最新版本。
+///
+/// # Errors
+/// 清单拉取失败、平台无载荷、版本号非法、下载或校验失败、替换重启失败
+/// 时返回 Err；迷你版发现"已是最新"同样视为错误（必须升级到正式版）。
 fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate)) -> Result<bool> {
+    // 自更新重启后的新一轮启动带有跳过标记：取下标记并直接放行。
     if std::env::var_os(LAUNCHER_UPDATE_SKIP_ENV).is_some() {
         info!("Skipping launcher update check after restart");
         std::env::remove_var(LAUNCHER_UPDATE_SKIP_ENV);
         return Ok(false);
     }
 
+    // 当前版本、迷你版标记与平台标识共同决定检查结果与下载载荷。
     let current_version = env!("CARGO_PKG_VERSION");
     let mini_launcher = launcher_version_is_mini(current_version);
     let platform_key = launcher_update_platform_key();
@@ -553,6 +724,7 @@ fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate
             "Launcher is up to date: current={}, latest={}",
             current_version, manifest.version
         );
+        // 迷你版不允许停留：即使无更新也报错，提示安装正式版。
         if mini_launcher {
             return Err(anyhow!(t!(
                 "launcher_update.mini_update_missing",
@@ -563,6 +735,7 @@ fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate
         return Ok(false);
     }
 
+    // 清单中没有当前平台的载荷：无法更新，报错提示。
     let Some(platform) = manifest.platforms.get(platform_key) else {
         warn!("No launcher update payload for platform {platform_key}");
         return Err(anyhow!(t!(
@@ -587,6 +760,7 @@ fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate
         .with_subtitle(t!("launcher_update.status")),
     );
 
+    // 下载到临时路径，校验通过后再替换自身并重启。
     let current_exe = std::env::current_exe()?;
     let update_path = launcher_update_temp_path(&current_exe);
     if let Err(err) = download_launcher_update(
@@ -598,6 +772,7 @@ fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate
         warn!("Launcher update download failed: {err:#}");
         return Err(err);
     }
+    // 非 Windows 平台需补执行权限（Windows 的可执行性由 .exe 扩展名决定）。
     make_executable(&update_path)?;
     status_updater(
         SplashUpdate::loading(
@@ -607,6 +782,7 @@ fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate
         )
         .with_subtitle(t!("launcher_update.restart_status")),
     );
+    // 替换自身并拉起新进程；新进程带跳过标记，不再重复检查更新。
     if let Err(err) = replace_launcher_and_restart(&current_exe, &update_path) {
         warn!("Launcher update replacement failed: {err:#}");
         return Err(err);
@@ -614,6 +790,14 @@ fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate
     Ok(true)
 }
 
+/// 下载启动器更新载荷到本地临时路径，并校验 SHA-256。
+///
+/// 先探测服务器是否支持 HTTP Range：支持且载荷足够大时多线程并行分片
+/// 下载，否则退回单连接顺序下载。下载或校验失败时清理残留文件。
+///
+/// # Errors
+/// 载荷 URL 校验失败、下载中断、合并后字节数不符或 SHA-256 不匹配时
+/// 返回 Err。
 fn download_launcher_update(
     url: &str,
     update_path: &Path,
@@ -622,17 +806,20 @@ fn download_launcher_update(
 ) -> Result<()> {
     validate_launcher_update_payload(url, expected_sha256)?;
 
-    // The public manifest supplies the payload URL; ESA requires mTLS for the payload itself.
+    // 载荷 URL 来自公开清单；ESA 边缘节点要求载荷请求携带 mTLS 客户端证书。
     let client = launcher_update_http_client(None, true)?;
+    // 预清理残留的 .part 与目标文件，保证本次下载从零开始。
     let part_path = launcher_update_part_path(update_path);
     remove_launcher_update_file_if_exists(&part_path)?;
     remove_launcher_update_file_if_exists(update_path)?;
 
     info!("Downloading launcher update from {url}");
+    // 先用 bytes=0-0 探测 Range 支持并获取总字节数，再决定下载策略。
     let range_total = launcher_update_range_total(&client, url)?;
     let download_result = match range_total {
         Some(total_bytes) => {
             let ranges = launcher_update_byte_ranges(total_bytes);
+            // 载荷大于一个分片才值得并行，小文件单连接更快更省事。
             if ranges.len() > 1 {
                 status_updater(
                     SplashUpdate::loading(
@@ -669,6 +856,7 @@ fn download_launcher_update(
             download_launcher_update_sequential(&client, url, &part_path, None, &mut status_updater)
         }
     };
+    // 下载失败时清理 .part 与目标文件，避免留下损坏的半成品。
     let _downloaded = match download_result {
         Ok(downloaded) => downloaded,
         Err(err) => {
@@ -686,6 +874,7 @@ fn download_launcher_update(
         .with_subtitle(t!("launcher_update.status")),
     );
 
+    // 下载完成后进入 SHA-256 校验与落地阶段（.part 重命名为正式文件）。
     let downloaded =
         match verify_and_promote_launcher_update(&part_path, update_path, expected_sha256) {
             Ok(downloaded) => downloaded,
@@ -703,6 +892,11 @@ fn download_launcher_update(
     Ok(())
 }
 
+/// 校验更新载荷 URL 与摘要格式：仅接受带主机的 HTTPS URL 与 64 位十六进制
+/// SHA-256 摘要，防止清单被篡改成明文 HTTP 或本地地址。
+///
+/// # Errors
+/// URL 不是 https、缺少主机名或摘要格式非法时返回 Err。
 fn validate_launcher_update_payload(url: &str, expected_sha256: &str) -> Result<()> {
     let parsed_url =
         Url::parse(url).with_context(|| format!("invalid launcher update URL: {url}"))?;
@@ -715,16 +909,26 @@ fn validate_launcher_update_payload(url: &str, expected_sha256: &str) -> Result<
     Ok(())
 }
 
+/// 判断字符串是否为合法的 SHA-256 十六进制摘要（64 个十六进制字符）。
 fn launcher_update_sha256_is_valid(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// 探测更新载荷服务器是否支持 HTTP Range，并取得载荷总字节数。
+///
+/// 发送 bytes=0-0 的探测请求；仅当响应为 206 且 Content-Range 表明总大小
+/// 有效时返回 Some(total)。
+///
+/// # Errors
+/// 探测请求本身失败（网络错误、非 2xx）时返回 Err；服务器不支持 Range
+/// 时返回 Ok(None)。
 fn launcher_update_range_total(client: &Client, url: &str) -> Result<Option<u64>> {
     let response = client
         .get(url)
         .header(RANGE, "bytes=0-0")
         .send()?
         .error_for_status()?;
+    // 非 206 说明服务器忽略了 Range，无法并行，也拿不到可靠总大小。
     if response.status() != StatusCode::PARTIAL_CONTENT {
         return Ok(None);
     }
@@ -737,12 +941,18 @@ fn launcher_update_range_total(client: &Client, url: &str) -> Result<Option<u64>
     else {
         return Ok(None);
     };
+    // 探测请求只取 1 字节：start/end 必须都是 0 才能据此信任 total。
     if start != 0 || end != 0 || total == 0 {
         return Ok(None);
     }
     Ok(Some(total))
 }
 
+/// 解析 Content-Range 头（形如 `bytes 10-19/42`）。
+///
+/// # Returns
+/// 合法且满足 start <= end < total 时返回 Some((start, end, total))；
+/// 其余情况（含通配 `*`）返回 None。
 fn parse_launcher_update_content_range(value: &str) -> Option<(u64, u64, u64)> {
     let value = value.trim().strip_prefix("bytes ")?;
     let (range, total) = value.split_once('/')?;
@@ -753,11 +963,17 @@ fn parse_launcher_update_content_range(value: &str) -> Option<(u64, u64, u64)> {
     (start <= end && end < total).then_some((start, end, total))
 }
 
+/// 把载荷总字节数均匀切分为若干连续字节区间。
+///
+/// 区间数量按"每片至少 LAUNCHER_UPDATE_MIN_CHUNK_BYTES"向上取整，并夹在
+/// 1 与 LAUNCHER_UPDATE_MAX_CONNECTIONS 之间；整除余数逐片分摊给前面的
+/// 区间，保证各区间首尾相接且恰好覆盖整个载荷。
 fn launcher_update_byte_ranges(total_bytes: u64) -> Vec<LauncherUpdateByteRange> {
     if total_bytes == 0 {
         return Vec::new();
     }
 
+    // 分片数 = 向上取整(总量/单片最小值)，并夹在 [1, MAX_CONNECTIONS] 之间。
     let range_count = total_bytes
         .saturating_add(LAUNCHER_UPDATE_MIN_CHUNK_BYTES - 1)
         .checked_div(LAUNCHER_UPDATE_MIN_CHUNK_BYTES)
@@ -777,6 +993,13 @@ fn launcher_update_byte_ranges(total_bytes: u64) -> Vec<LauncherUpdateByteRange>
     ranges
 }
 
+/// 多线程并行下载各字节区间到临时目录的分片文件，随后按序合并。
+///
+/// 每个分片由独立线程下载，经 mpsc 通道上报进度；主循环每 100ms 汇聚一次
+/// 增量并节流刷新 splash。全部完成后校验总字节数一致才执行合并。
+///
+/// # Errors
+/// 任一 worker panic、分片字节数合计与总大小不符或合并失败时返回 Err。
 fn download_launcher_update_parallel(
     client: &Client,
     url: &str,
@@ -785,6 +1008,7 @@ fn download_launcher_update_parallel(
     part_path: &Path,
     status_updater: &mut impl FnMut(SplashUpdate),
 ) -> Result<u64> {
+    // 分片先写入独立临时目录，全部校验通过后才合并到正式 .part 路径。
     let temp_dir = TempDirBuilder::new()
         .prefix("azurpilot-launcher-update-")
         .tempdir()
@@ -793,6 +1017,7 @@ fn download_launcher_update_parallel(
     let mut workers = Vec::with_capacity(ranges.len());
     let mut chunk_paths = Vec::with_capacity(ranges.len());
 
+    // 每个区间一个 worker 线程，独立持有客户端克隆、URL 与分片路径。
     for (index, range) in ranges.iter().copied().enumerate() {
         let chunk_path = temp_dir.path().join(format!("chunk-{index:02}"));
         let worker_client = client.clone();
@@ -810,12 +1035,14 @@ fn download_launcher_update_parallel(
         }));
         chunk_paths.push(chunk_path);
     }
+    // 主动丢弃主发送端：worker 全部结束后通道断开，主循环得以退出。
     drop(progress_sender);
 
     let started_at = Instant::now();
     let mut downloaded_so_far = 0u64;
     let mut last_reported_progress = LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START;
     let mut last_reported_at = Instant::now() - Duration::from_secs(1);
+    // 每 100ms 醒一次：汇总各 worker 上报的进度增量并节流刷新 splash。
     while workers.iter().any(|worker| !worker.is_finished()) {
         match progress_receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(downloaded) => {
@@ -833,10 +1060,12 @@ fn download_launcher_update_parallel(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    // worker 收尾后再清空一次通道，避免漏计尾部进度。
     while let Ok(downloaded) = progress_receiver.try_recv() {
         downloaded_so_far = downloaded_so_far.saturating_add(downloaded);
     }
 
+    // join 各 worker 并累计字节数：任一 worker panic 视为整体失败。
     let mut completed_bytes = 0u64;
     for worker in workers {
         completed_bytes = completed_bytes.saturating_add(
@@ -853,6 +1082,7 @@ fn download_launcher_update_parallel(
         );
     }
 
+    // 合并前把进度刷满下载区间，避免 UI 停在中间值。
     report_launcher_update_download_progress(
         status_updater,
         total_bytes,
@@ -872,6 +1102,13 @@ fn download_launcher_update_parallel(
     Ok(merged_bytes)
 }
 
+/// 下载单个字节区间到指定分片文件。
+///
+/// 严格校验响应：必须为 206、Content-Range 与请求区间一致、Content-Length
+/// （如存在）等于区间长度，防止服务器忽略 Range 导致分片错位。
+///
+/// # Errors
+/// 校验失败、写文件失败或实际下载数与区间长度不符时返回 Err。
 fn download_launcher_update_range(
     client: &Client,
     url: &str,
@@ -909,6 +1146,7 @@ fn download_launcher_update_range(
         );
     }
 
+    // 期望字节数即闭区间长度（两端均含）。
     let expected_bytes = range.end - range.start + 1;
     if response
         .content_length()
@@ -921,6 +1159,7 @@ fn download_launcher_update_range(
         );
     }
 
+    // 边读边写分片文件，并把每次写入的字节数经通道上报给进度汇总。
     let mut file = fs::File::create(chunk_path)?;
     let mut downloaded = 0u64;
     let mut buffer = [0u8; 128 * 1024];
@@ -935,6 +1174,7 @@ fn download_launcher_update_range(
     }
     file.flush()?;
 
+    // 最终核对：实际下载数必须与区间长度完全一致。
     if downloaded != expected_bytes {
         bail!(
             "launcher update range download incomplete for bytes {}-{}: expected {} bytes, got {} bytes",
@@ -947,6 +1187,10 @@ fn download_launcher_update_range(
     Ok(downloaded)
 }
 
+/// 按顺序把各分片文件合并写入目标 .part 文件。
+///
+/// # Errors
+/// 创建输出文件、读取分片或写盘失败时返回 Err。
 fn merge_launcher_update_chunks(chunk_paths: &[PathBuf], part_path: &Path) -> Result<u64> {
     let mut output = fs::File::create(part_path).with_context(|| {
         t!(
@@ -968,6 +1212,8 @@ fn merge_launcher_update_chunks(chunk_paths: &[PathBuf], part_path: &Path) -> Re
     Ok(written)
 }
 
+/// 汇总并行下载进度并节流刷新 splash：进度百分比提升时立即刷新，否则
+/// 至多每 250ms 刷新一次，避免高频更新拖慢 UI。
 fn report_launcher_update_download_progress(
     status_updater: &mut impl FnMut(SplashUpdate),
     downloaded: u64,
@@ -990,6 +1236,10 @@ fn report_launcher_update_download_progress(
     }
 }
 
+/// 校验 .part 文件的 SHA-256，通过后重命名为正式更新文件。
+///
+/// # Errors
+/// 摘要不匹配（同时删除 .part）、读取元数据或重命名失败时返回 Err。
 fn verify_and_promote_launcher_update(
     part_path: &Path,
     update_path: &Path,
@@ -997,6 +1247,7 @@ fn verify_and_promote_launcher_update(
 ) -> Result<u64> {
     let digest_hex = sha256_file(part_path)?;
     if !digest_hex.eq_ignore_ascii_case(expected_sha256) {
+        // 摘要不匹配：删除半成品，避免下次误用。
         let _ = fs::remove_file(part_path);
         bail!(
             "launcher update sha256 mismatch: expected {}, got {}",
@@ -1007,6 +1258,7 @@ fn verify_and_promote_launcher_update(
 
     let downloaded = fs::metadata(part_path)?.len();
     remove_launcher_update_file_if_exists(update_path)?;
+    // 同目录 rename 原子性较好：校验通过后"晋升"为正式更新文件。
     fs::rename(part_path, update_path).with_context(|| {
         format!(
             "promote verified launcher update from {} to {}",
@@ -1017,6 +1269,7 @@ fn verify_and_promote_launcher_update(
     Ok(downloaded)
 }
 
+/// 由最终更新文件路径推导下载中的临时 .part 路径（同名追加 .part 后缀）。
 fn launcher_update_part_path(update_path: &Path) -> PathBuf {
     let Some(file_name) = update_path.file_name() else {
         return update_path.with_extension("part");
@@ -1026,6 +1279,10 @@ fn launcher_update_part_path(update_path: &Path) -> PathBuf {
     update_path.with_file_name(part_name)
 }
 
+/// 删除指定文件；文件不存在视为成功。
+///
+/// # Errors
+/// 删除时发生非 NotFound 的 IO 错误时返回 Err。
 fn remove_launcher_update_file_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1034,6 +1291,8 @@ fn remove_launcher_update_file_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+/// 清理下载失败后的 .part 与目标文件；清理失败仅记录告警，不中断调用方
+/// 的错误处理流程。
 fn cleanup_launcher_update_download_files(part_path: &Path, update_path: &Path) {
     for path in [part_path, update_path] {
         if let Err(error) = remove_launcher_update_file_if_exists(path) {
@@ -1045,6 +1304,10 @@ fn cleanup_launcher_update_download_files(part_path: &Path, update_path: &Path) 
     }
 }
 
+/// 单连接顺序下载更新载荷到指定路径，边下载边节流上报进度。
+///
+/// # Errors
+/// 请求失败、写盘失败或与预期总字节数不符时返回 Err。
 fn download_launcher_update_sequential(
     client: &Client,
     url: &str,
@@ -1053,6 +1316,7 @@ fn download_launcher_update_sequential(
     mut status_updater: impl FnMut(SplashUpdate),
 ) -> Result<u64> {
     let mut response = client.get(url).send()?.error_for_status()?;
+    // 优先使用 Range 探测得到的总大小，其次取响应 Content-Length。
     let total_bytes = expected_total_bytes.or_else(|| response.content_length());
     let mut file = fs::File::create(update_path).with_context(|| {
         t!(
@@ -1081,6 +1345,7 @@ fn download_launcher_update_sequential(
         })?;
         downloaded += size as u64;
 
+        // 进度刷新节流：百分比提升立即刷，否则至多每 250ms 一次。
         let (progress, detail) =
             launcher_download_progress_detail(downloaded, total_bytes, download_started_at);
         if progress > last_reported_progress
@@ -1101,6 +1366,7 @@ fn download_launcher_update_sequential(
         )
     })?;
 
+    // 已知总大小时核对下载完整性。
     if let Some(total_bytes) = total_bytes {
         if downloaded != total_bytes {
             return Err(anyhow!(
@@ -1114,6 +1380,10 @@ fn download_launcher_update_sequential(
     Ok(downloaded)
 }
 
+/// 分块计算指定文件的 SHA-256 摘要，返回小写十六进制字符串。
+///
+/// # Errors
+/// 文件打开或读取失败时返回 Err。
 fn sha256_file(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -1131,6 +1401,10 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(bytes_to_hex(&digest))
 }
 
+/// 根据已下载字节数生成 splash 进度值与详情文案。
+///
+/// 已知总大小时把下载百分比线性映射进 [START, END] 进度区间；未知时按
+/// 每 MiB 一格推进并封顶在 END，文案改用"已下载/未知总量"版本。
 fn launcher_download_progress_detail(
     downloaded: u64,
     total_bytes: Option<u64>,
@@ -1169,6 +1443,7 @@ fn launcher_download_progress_detail(
     (progress, detail)
 }
 
+/// 把字节数格式化为人类可读字符串（B/KiB/MiB/GiB，保留 1 位小数）。
 fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -1186,15 +1461,19 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// 计算平均下载速度（字节/秒）；耗时不足 0.1 秒时按 0.1 秒折算，避免除零。
 fn download_speed_bytes_per_second(downloaded: u64, started_at: Instant) -> f64 {
     let elapsed = started_at.elapsed().as_secs_f64().max(0.1);
     downloaded as f64 / elapsed
 }
 
+/// 把速度（字节/秒）四舍五入后复用字节数格式化输出。
 fn format_speed(bytes_per_second: f64) -> String {
     format_bytes(bytes_per_second.max(0.0).round() as u64)
 }
 
+/// 返回当前操作系统与架构对应的更新清单平台标识（如 windows-x86_64）。
+/// 未识别的组合返回 "unknown"（清单中无该载荷，更新会报缺失）。
 fn launcher_update_platform_key() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "darwin-aarch64",
@@ -1208,14 +1487,27 @@ fn launcher_update_platform_key() -> &'static str {
     }
 }
 
+/// 比较版本号，判断 latest 是否严格大于 current。
+///
+/// # Returns
+/// 任一版本号无法解析时返回 None（调用方按无效清单处理）。
 fn launcher_version_is_newer(current: &str, latest: &str) -> Option<bool> {
     let current = parse_launcher_version(current)?;
     let latest = parse_launcher_version(latest)?;
     Some(latest > current)
 }
 
+/// 解析启动器版本号为可比较的四元组 (major, minor, patch, 后缀序号)。
+///
+/// 支持 `v` 前缀、`-` 预发布后缀与 `+` 构建元数据；后缀序号取预发布段
+/// 末尾的连续数字（如 build.3 -> 3，无数字视为 0），实现 alpha/beta 之类
+/// 预发布版本间的次序比较。
+///
+/// # Returns
+/// 格式非法（缺段、段非数字、后缀非法）时返回 None。
 fn parse_launcher_version(version: &str) -> Option<(u64, u64, u64, u64)> {
     let version = version.strip_prefix('v').unwrap_or(version);
+    // 构建元数据（+ 后段）只做合法性校验，不参与比较。
     let version = match version.split_once('+') {
         Some((version, build_metadata)) if valid_launcher_version_suffix(build_metadata) => version,
         Some(_) => return None,
@@ -1232,6 +1524,7 @@ fn parse_launcher_version(version: &str) -> Option<(u64, u64, u64, u64)> {
     if nums.next().is_some() {
         return None;
     }
+    // 后缀序号：取预发布段末尾连续数字并倒序重组（如 rc12 -> 12）。
     let suffix_rank = suffix
         .chars()
         .rev()
@@ -1245,6 +1538,8 @@ fn parse_launcher_version(version: &str) -> Option<(u64, u64, u64, u64)> {
     Some((major, minor, patch, suffix_rank))
 }
 
+/// 判断语义化版本后缀是否合法：非空且以 `.` 分隔的各段均由 ASCII 字母、
+/// 数字或连字符组成。
 fn valid_launcher_version_suffix(value: &str) -> bool {
     !value.is_empty()
         && value.split('.').all(|identifier| {
@@ -1255,6 +1550,7 @@ fn valid_launcher_version_suffix(value: &str) -> bool {
         })
 }
 
+/// 检查命令行参数（跳过 argv[0]）中是否出现给定标志之一（忽略大小写）。
 fn launcher_arg_present(flags: &[&str]) -> bool {
     std::env::args().skip(1).any(|arg| {
         let arg = arg.to_ascii_lowercase();
@@ -1262,18 +1558,23 @@ fn launcher_arg_present(flags: &[&str]) -> bool {
     })
 }
 
+/// 是否以"跳过更新检查"预览模式启动（用于测试无更新时的启动路径）。
 fn preview_no_update_arg_present() -> bool {
     launcher_arg_present(PREVIEW_NO_UPDATE_ARGS)
 }
 
+/// 是否以"启动即报错"预览模式启动（用于测试 splash 错误态展示）。
 fn preview_crash_arg_present() -> bool {
     launcher_arg_present(PREVIEW_CRASH_ARGS)
 }
 
+/// 是否以"启动后最小化到托盘"模式启动。
 fn start_minimized_arg_present() -> bool {
     launcher_arg_present(START_MINIMIZED_ARGS)
 }
 
+/// 生成更新载荷的临时落地路径：系统临时目录 + 进程 ID + 原可执行文件名，
+/// 避免多实例或并发更新互相覆盖。
 fn launcher_update_temp_path(current_exe: &Path) -> PathBuf {
     let file_name = current_exe
         .file_name()
@@ -1285,6 +1586,7 @@ fn launcher_update_temp_path(current_exe: &Path) -> PathBuf {
     ))
 }
 
+/// 把字节序列格式化为小写十六进制字符串。
 fn bytes_to_hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1294,6 +1596,13 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     output
 }
 
+/// 确保更新后的可执行文件具备执行权限。
+///
+/// 平台差异：Unix 需显式 chmod 0o755；Windows 的可执行性由 .exe 扩展名
+/// 决定，无需处理。
+///
+/// # Errors
+/// Unix 上读取或设置权限失败时返回 Err。
 fn make_executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1309,6 +1618,13 @@ fn make_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 非 Windows 平台的自更新落地：直接把新可执行文件重命名覆盖旧文件，
+/// 随后带"跳过更新"环境变量拉起新进程。
+///
+/// Unix 允许覆盖正在运行的程序文件（inode 已映射），因此无需助手进程。
+///
+/// # Errors
+/// 重命名或拉起新进程失败时返回 Err。
 #[cfg(not(windows))]
 fn replace_launcher_and_restart(current_exe: &Path, update_path: &Path) -> Result<()> {
     fs::rename(update_path, current_exe).with_context(|| {
@@ -1329,6 +1645,11 @@ fn replace_launcher_and_restart(current_exe: &Path, update_path: &Path) -> Resul
     Ok(())
 }
 
+/// Windows 平台的自更新落地：运行中的 exe 无法直接覆盖自身，因此先复制
+/// 自身为临时助手进程，再由助手等待本进程退出后完成替换与重启。
+///
+/// # Errors
+/// 复制自身或启动助手失败时返回 Err。
 #[cfg(windows)]
 fn replace_launcher_and_restart(current_exe: &Path, update_path: &Path) -> Result<()> {
     let helper_path = std::env::temp_dir().join(format!(
@@ -1346,6 +1667,7 @@ fn replace_launcher_and_restart(current_exe: &Path, update_path: &Path) -> Resul
 
     use std::os::windows::process::CommandExt;
     use winapi::um::winbase::CREATE_NO_WINDOW;
+    // CREATE_NO_WINDOW：助手是控制台程序的副本，执行时避免闪出黑窗。
     Command::new(&helper_path)
         .arg(LAUNCHER_UPDATE_APPLY_ARG)
         .arg(current_exe)
@@ -1363,10 +1685,18 @@ fn replace_launcher_and_restart(current_exe: &Path, update_path: &Path) -> Resul
     Ok(())
 }
 
+/// Windows 更新助手模式入口：检查命令行是否携带 --apply-launcher-update。
+///
+/// 命中时按"目标 exe 路径 + 更新载荷路径"执行替换并重启，返回 Ok(true)
+/// 表示本进程以助手身份完成使命，main 应直接返回、不再走正常启动流程。
+///
+/// # Errors
+/// 有标记但缺少路径参数，或替换过程失败时返回 Err。
 #[cfg(windows)]
 fn try_apply_launcher_update_from_args() -> Result<bool> {
     use std::ffi::OsStr;
 
+    // argv[1] 是模式标记，argv[2]/argv[3] 分别为目标 exe 与更新载荷路径。
     let mut args = std::env::args_os();
     let _ = args.next();
     let Some(mode) = args.next() else {
@@ -1386,9 +1716,15 @@ fn try_apply_launcher_update_from_args() -> Result<bool> {
     Ok(true)
 }
 
+/// 助手核心逻辑：以 1 秒间隔至多重试 60 次替换目标 exe（等待旧进程退出并
+/// 释放文件占用），成功后重启启动器并把助手自身的临时副本登记为重启后删除。
+///
+/// # Errors
+/// 60 次重试后仍无法替换时返回最后一次的 Err。
 #[cfg(windows)]
 fn apply_launcher_update_and_restart(target_path: PathBuf, update_path: PathBuf) -> Result<()> {
     let mut last_error = None;
+    // 每次失败休眠 1 秒再试：给旧进程留出退出并释放 exe 句柄的时间。
     for _ in 0..60 {
         match move_file_replace(&update_path, &target_path) {
             Ok(()) => {
@@ -1406,6 +1742,11 @@ fn apply_launcher_update_and_restart(target_path: PathBuf, update_path: PathBuf)
     Err(last_error.unwrap_or_else(|| anyhow!("launcher update replacement timed out")))
 }
 
+/// 调用 Win32 MoveFileExW 以"替换已存在 + 允许跨卷 + 直写磁盘"标志移动
+/// 文件，实现覆盖式替换。
+///
+/// # Errors
+/// API 返回 0（替换失败）时返回携带 last_os_error 的 Err。
 #[cfg(windows)]
 fn move_file_replace(from: &Path, to: &Path) -> Result<()> {
     use winapi::um::winbase::{
@@ -1429,6 +1770,10 @@ fn move_file_replace(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 更新落地后重启启动器：带"跳过更新"与"无控制台"环境变量拉起新 exe。
+///
+/// # Errors
+/// 进程创建失败时返回 Err。
 #[cfg(windows)]
 fn restart_launcher_after_update(target_path: &Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
@@ -1448,6 +1793,9 @@ fn restart_launcher_after_update(target_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 把指定文件登记为系统重启时删除（MOVEFILE_DELAY_UNTIL_REBOOT）。
+/// 此处用于清理更新助手自身（旧启动器的临时副本）；登记失败无伤大雅，
+/// 因此忽略返回值。
 #[cfg(windows)]
 fn schedule_file_delete_on_reboot(path: &Path) {
     use std::ptr;
@@ -1457,6 +1805,7 @@ fn schedule_file_delete_on_reboot(path: &Path) {
     let _ = unsafe { MoveFileExW(path_wide.as_ptr(), ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
 }
 
+/// 把路径编码为以空终止符结尾的 Windows 宽字符（UTF-16），供 Win32 API 使用。
 #[cfg(windows)]
 fn path_to_wide(path: &Path) -> Vec<u16> {
     use std::{iter, os::windows::ffi::OsStrExt};
@@ -1467,10 +1816,14 @@ fn path_to_wide(path: &Path) -> Vec<u16> {
         .collect()
 }
 
+/// main.rs 纯函数逻辑的单元测试：覆盖时间炸弹配置解析、Cargo.toml 键值
+/// 读取、splash HTML 生成、日志截断、标题栏注入脚本、版本比较、更新清单
+/// 主备回退、Range 探测与并行下载合并、校验晋升等。
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 时间炸弹段 enabled 时应能解析出配置（且与 enabled 值一致）。
     #[test]
     fn test_time_bomb_config_parses_when_enabled() {
         let section =
@@ -1480,6 +1833,7 @@ mod tests {
         assert_eq!(config.is_some(), enabled);
     }
 
+    /// cargo_toml_value 应能读到 expires-at 与中文 message 字段。
     #[test]
     fn test_cargo_toml_value_reads_time_bomb_fields() {
         let section =
@@ -1491,6 +1845,7 @@ mod tests {
         );
     }
 
+    /// backend_unready_error 携带日志失败原因时拼接展示，无原因时保持原样。
     #[test]
     #[test]
     fn backend_unready_error_carries_the_reason_from_the_log() {
@@ -1504,6 +1859,7 @@ mod tests {
         assert_eq!(format!("{without_reason:#}"), "connect failed");
     }
 
+    /// 英文环境下 splash HTML 的文案应来自 JSON 字面量（而非 JS 单引号拼接）。
     fn test_english_splash_i18n_uses_json_literals() {
         rust_i18n::set_locale("en");
 
@@ -1518,6 +1874,7 @@ mod tests {
         assert!(!html.contains("text-transform: uppercase;"));
     }
 
+    /// splash HTML 应包含可选的 uv 安装进度子条相关标记与样式。
     #[test]
     fn test_splash_includes_optional_uv_progress() {
         let html = splash_redesigned_shell_html("video", "font");
@@ -1533,6 +1890,7 @@ mod tests {
         assert!(!html.contains("animation: sweep"));
     }
 
+    /// 截断日志文件应把已存在的旧内容清空。
     #[test]
     fn test_truncate_log_file_replaces_existing_contents() {
         let temp_dir = TempDirBuilder::new()
@@ -1548,6 +1906,7 @@ mod tests {
         assert_eq!(fs::read(&path).expect("read truncated log"), b"");
     }
 
+    /// 标题栏应使用 WebView 可拖拽区域（pointerdown + app-region）支持触摸拖动。
     #[test]
     fn test_titlebars_use_webview_draggable_regions_for_touch_dragging() {
         let splash_html = splash_redesigned_shell_html("video", "font");
@@ -1594,6 +1953,7 @@ mod tests {
         }
     }
 
+    /// tauri.conf.json 中 Windows 窗口应启用 WebView2 拖拽区域等浏览器参数。
     #[test]
     fn test_windows_enable_webview_draggable_regions() {
         let config: serde_json::Value =
@@ -1611,6 +1971,7 @@ mod tests {
         }
     }
 
+    /// 版本比较：合法版本可比较，非法版本返回 None。
     #[test]
     fn test_launcher_update_versions_must_be_valid() {
         assert_eq!(launcher_version_is_newer("2.1.6", "2.1.7"), Some(true));
@@ -1623,6 +1984,7 @@ mod tests {
         assert_eq!(launcher_version_is_newer("2.1.6", "2.1.7-"), None);
     }
 
+    /// 主清单 URL 失败（503）时应回退到备用 URL 并成功解析。
     #[test]
     fn test_launcher_update_manifest_uses_fallback_url() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
@@ -1677,6 +2039,7 @@ mod tests {
         server.join().expect("manifest server completed");
     }
 
+    /// 载荷校验：仅接受 HTTPS URL 与合法 SHA-256 摘要。
     #[test]
     fn test_launcher_update_payload_requires_https_and_sha256() {
         let digest = "a".repeat(64);
@@ -1694,6 +2057,7 @@ mod tests {
         .is_err());
     }
 
+    /// 字节区间切分：区间数量、覆盖范围与无重叠应满足约定。
     #[test]
     fn test_launcher_update_byte_ranges_cover_payload_once() {
         let total_bytes = LAUNCHER_UPDATE_MIN_CHUNK_BYTES * 8 + 17;
@@ -1714,6 +2078,7 @@ mod tests {
             .all(|pair| pair[0].end + 1 == pair[1].start));
     }
 
+    /// Content-Range 解析：合法值与非法值（通配、倒序、无前缀）的处理。
     #[test]
     fn test_launcher_update_content_range_parser() {
         assert_eq!(
@@ -1725,6 +2090,7 @@ mod tests {
         assert_eq!(parse_launcher_update_content_range("not-a-range"), None);
     }
 
+    /// 服务器忽略 Range 直接返回 200 时，探测应返回 None 以走顺序下载。
     #[test]
     fn test_launcher_update_range_probe_falls_back_when_ignored() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
@@ -1761,6 +2127,7 @@ mod tests {
         server.join().expect("range probe server completed");
     }
 
+    /// 并行下载应按 Range 取回各分片，并合并出与原载荷一致的文件。
     #[test]
     fn test_parallel_launcher_update_download_merges_ranges() {
         let payload: Vec<u8> = (0..(LAUNCHER_UPDATE_MIN_CHUNK_BYTES * 2 + 17))
@@ -1851,6 +2218,7 @@ mod tests {
         server.join().expect("range server completed");
     }
 
+    /// 校验晋升：摘要匹配才允许重命名落地，不匹配时清理半成品。
     #[test]
     fn test_launcher_update_promotion_requires_valid_digest() {
         let temp_dir = TempDirBuilder::new()
@@ -1887,7 +2255,11 @@ mod tests {
     }
 }
 
-/// Set macOS activation policy to Regular (show in dock) or Accessory (hide from dock).
+/// 切换 macOS 激活策略：Regular 在 Dock 显示应用图标，Accessory 隐藏
+/// Dock 图标（托盘化状态）。
+///
+/// 平台差异：激活策略是 macOS 特有概念；无可见常规窗口时切换为 Accessory
+/// 可避免应用因"没有可见窗口"而表现异常。
 #[cfg(target_os = "macos")]
 fn set_macos_activation_policy(app: &tauri::AppHandle, regular: bool) {
     let policy = if regular {
@@ -1900,6 +2272,14 @@ fn set_macos_activation_policy(app: &tauri::AppHandle, regular: bool) {
     }
 }
 
+/// Windows 专用：检查 Node.js 可用性，缺失或版本过低时弹窗引导安装。
+///
+/// 仅 Windows 需要：其发布包可能在运行时现场构建前端产物，依赖 Node.js；
+/// macOS/Linux 发布包通常已自带构建产物。
+///
+/// # Returns
+/// 是否可继续启动流程：Node 就绪、用户拒绝安装、安装失败（已提示）均返回
+/// true；用户取消或安装被中断返回 false。
 #[cfg(windows)]
 fn prompt_for_missing_nodejs(
     app_handle: &tauri::AppHandle,
@@ -1934,6 +2314,7 @@ fn prompt_for_missing_nodejs(
         ),
     };
     warn!("{log}");
+    // 最小化启动时先把 splash 唤起，保证弹窗有父窗口可依附。
     if start_minimized {
         let _ = reveal_window(splash);
     }
@@ -1943,6 +2324,7 @@ fn prompt_for_missing_nodejs(
         5,
     ));
 
+    // 阻塞式弹窗：用户选择"立即安装"才进入安装流程，"暂不"则继续启动。
     let install_requested = app_handle
         .dialog()
         .message(message)
@@ -1967,6 +2349,8 @@ fn prompt_for_missing_nodejs(
         Err(_) if cancel_requested.load(Ordering::SeqCst) => false,
         Err(error) => {
             error!("Node.js installation failed: {error:#}");
+            // 安装失败：splash 进入错误态并弹窗提示，但流程仍继续——
+            // 后续步骤失败时会给出更具体的报错。
             status_updater(SplashUpdate::error(
                 t!("dialog.nodejs_install_failed"),
                 t!(
@@ -1990,12 +2374,22 @@ fn prompt_for_missing_nodejs(
     }
 }
 
+/// 应用入口：装配 Tauri Builder（自定义协议、命令、插件、托盘、单实例），
+/// 注册 Ready/ExitRequested/WindowEvent 等运行事件处理，并在后台线程驱动
+/// "自更新检查 → 仓库准备 → 后端启动 → 主窗口展示"的完整启动流程。
+///
+/// # Errors
+/// 环境准备（setup_environment）或日志初始化失败时返回 Err，进程随即结束。
 fn main() -> Result<()> {
+    // Windows 更新助手模式：命中 --apply-launcher-update 参数时完成替换并
+    // 重启目标，随后直接退出，不走正常启动流程。
     #[cfg(windows)]
     if try_apply_launcher_update_from_args()? {
         return Ok(());
     }
 
+    // 更新助手拉起的进程不附着控制台；普通启动则尝试附着父进程控制台，
+    // 使命令行运行时能看到 stderr 输出（结果记录进 HAS_CONSOLE）。
     #[cfg(windows)]
     unsafe {
         use crate::window_util::HAS_CONSOLE;
@@ -2007,9 +2401,12 @@ fn main() -> Result<()> {
             HAS_CONSOLE.store(AttachConsole(ATTACH_PARENT_PROCESS) != 0, Ordering::Relaxed);
         }
     }
+    // 初始化运行环境（切换工作目录等，详见 setup 模块）。
     setup_environment()?;
+    // 日志守卫必须存活到进程结束，退出时负责刷盘。
     let _log_guard = initialize_logging()?;
     crate::i18n::init();
+    // 解析预览与最小化启动参数（测试/演示用）。
     let preview_crash = preview_crash_arg_present();
     let preview_no_update = preview_crash || preview_no_update_arg_present();
     let start_minimized = start_minimized_arg_present();
@@ -2026,6 +2423,7 @@ fn main() -> Result<()> {
         info!("Start minimized mode enabled; main window will stay in tray after backend is ready");
     }
 
+    // 读取 deploy.yaml 得到 WebUI 启动配置；缺失时使用默认配置（端口 22267）。
     let deploy_config = get_deploy_config();
     let webui_config = WebuiLaunchConfig::from_deploy_config(deploy_config.as_ref());
     if deploy_config.is_none() {
@@ -2033,6 +2431,8 @@ fn main() -> Result<()> {
     }
     let port = webui_config.port;
 
+    // 各线程共享的运行状态：后端句柄与一组生命周期标志
+    // （退出放行、启动阻塞、setup 取消/运行/完成、清理触发、主窗口重建中）。
     let backend = Arc::new(Mutex::new(None));
     let allow_exit = Arc::new(AtomicBool::new(false));
     let launch_blocked = Arc::new(AtomicBool::new(false));
@@ -2051,11 +2451,14 @@ fn main() -> Result<()> {
     let start_minimized_for_run = start_minimized;
 
     info!("Starting Webview...");
+    // 注册 alas-error:// 自定义协议：服务后端连接失败的错误页面。
     tauri::Builder::default()
         .register_uri_scheme_protocol("alas-error", |_ctx, request| {
             backend_error_response(request)
         })
+        // 注册 alas-splash:// 自定义协议：服务 splash 启动画面页面。
         .register_uri_scheme_protocol("alas-splash", |_ctx, _request| splash_response())
+        // 注册前端可调用的 Tauri 命令：文件保存、日志下载、窗口控制等。
         .manage(ExitControl(allow_exit.clone()))
         .invoke_handler(tauri::generate_handler![
             save_as,
@@ -2072,6 +2475,7 @@ fn main() -> Result<()> {
         ])
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        // 单实例插件：二次启动时唤起已有实例的主窗口，而不是再开一个进程。
         .plugin(tauri_plugin_single_instance::init(
             move |app, _argv, _cwd| {
                 restore_main_window_from_tray(
@@ -2081,7 +2485,9 @@ fn main() -> Result<()> {
                 );
             },
         ))
+        // setup 回调：时间炸弹校验、主窗口创建与系统托盘装配。
         .setup(move |app| {
+            // 时间炸弹校验：已过期则弹窗提示并以退出码 0 结束，阻止继续启动。
             match time_bomb_expiration_message() {
                 Ok(Some(message)) => {
                     launch_blocked_for_setup.store(true, Ordering::SeqCst);
@@ -2101,9 +2507,10 @@ fn main() -> Result<()> {
                 }
             }
 
+            // 提前创建主窗口（隐藏态），等后端就绪后再导航并显示。
             create_main_window(&app.handle(), port)?;
 
-            // Windows and macOS: create system tray
+            // Windows 与 macOS：创建系统托盘（Linux 桌面托盘兼容性参差，暂不提供）。
             #[cfg(any(windows, target_os = "macos"))]
             {
                 info!("Creating system tray...");
@@ -2111,6 +2518,7 @@ fn main() -> Result<()> {
                 let recreating_main_window_for_menu = recreating_main_window_for_setup.clone();
                 #[cfg(windows)]
                 let recreating_main_window_for_tray = recreating_main_window_for_setup.clone();
+                // 托盘菜单：显示/隐藏主窗口与退出两项。
                 let show_item = MenuItemBuilder::new(t!("tray.toggle_visibility"))
                     .id("toggle_visibility")
                     .build(app)?;
@@ -2125,7 +2533,7 @@ fn main() -> Result<()> {
 
                 info!("Tray menu created successfully");
 
-                // Use embedded icon bytes so packaged apps always load the tray icon correctly.
+                // 使用内嵌图标字节，保证打包后的应用也能正确加载托盘图标。
                 let icon = tray_icon_for_platform();
 
                 info!("Building tray icon...");
@@ -2134,13 +2542,13 @@ fn main() -> Result<()> {
                     .tooltip("AzurPilot")
                     .menu(&tray_menu);
 
-                // On Windows, show menu on right click
+                // Windows：右键点击托盘图标才弹出菜单。
                 #[cfg(windows)]
                 {
                     tray_builder = tray_builder.show_menu_on_left_click(false);
                 }
 
-                // On macOS, show menu on left click
+                // macOS：左键点击即弹出菜单（菜单栏图标没有其他左键行为）。
                 #[cfg(target_os = "macos")]
                 {
                     info!("Setting macOS tray to show menu on left click");
@@ -2166,6 +2574,8 @@ fn main() -> Result<()> {
                         }
                     })
                     .on_tray_icon_event(move |tray, event| {
+                        // Windows：左键单击切换主窗口可见性；macOS 左键已用于
+                        // 弹出菜单，此处忽略。
                         #[cfg(windows)]
                         if let tauri::tray::TrayIconEvent::Click {
                             button: tauri::tray::MouseButton::Left,
@@ -2201,16 +2611,19 @@ fn main() -> Result<()> {
 
             Ok(())
         })
+        // 运行事件循环；Ready 事件触发后在后台线程执行完整启动流程。
         .build(tauri::generate_context!())?
         .run(move |app_handle, event| {
             match event {
                 tauri::RunEvent::Ready => {
+                    // 时间炸弹已过期：什么都不做，等待弹窗回调退出进程。
                     if launch_blocked_for_run.load(Ordering::SeqCst) {
                         debug!("Launch blocked by test expiration");
                         return;
                     }
 
                     debug!("RunEvent::Ready");
+                    // Ctrl-C：置放行标志后直接退出，保证命令行下也能干净终止。
                     let allow_exit = allow_exit.clone();
                     let allow_exit_for_ctrlc = allow_exit.clone();
                     let handle1 = app_handle.clone();
@@ -2227,10 +2640,13 @@ fn main() -> Result<()> {
                     let setup_completed = setup_completed.clone();
                     let recreating_main_window_for_notify = recreating_main_window_for_run.clone();
                     let start_minimized = start_minimized_for_run;
+                    // 完整启动流程放在后台线程执行，避免阻塞 Tauri 事件循环。
                     thread::spawn(move || {
                         setup_running.store(true, Ordering::SeqCst);
+                        // splash 由 tauri.conf.json 静态声明，此处必然能取到。
                         let splash = app_handle.get_webview_window("splash").unwrap();
                         initialize_splash(&splash, !start_minimized);
+                        // 进度只升不降：记录历史最高值，防止不同阶段进度回跳。
                         let last_progress = Cell::new(0u8);
                         let mut status_updater = |mut update: SplashUpdate| {
                             update.progress = update.progress.max(last_progress.get());
@@ -2251,7 +2667,9 @@ fn main() -> Result<()> {
                             )),
                         );
 
+                        // 启动器自更新检查：成功替换重启时直接退出本进程交棒新版本。
                         if !preview_no_update {
+                            // 自更新的进度单独记一条"历史最高"，与主流程互不回退。
                             let launcher_progress = Cell::new(0u8);
                             let mut launcher_status_updater = |mut update: SplashUpdate| {
                                 update.progress = update.progress.max(launcher_progress.get());
@@ -2289,6 +2707,7 @@ fn main() -> Result<()> {
                             }
                         }
 
+                        // 预览崩溃模式：直接在 splash 呈现错误态并停止启动流程。
                         if preview_crash {
                             if start_minimized {
                                 let _ = reveal_window(&splash);
@@ -2310,6 +2729,8 @@ fn main() -> Result<()> {
                             return;
                         }
 
+                        // Windows：检查 Node.js，缺失或版本过低时引导安装
+                        // （前端可能需在运行时现场构建）。
                         #[cfg(windows)]
                         if !prompt_for_missing_nodejs(
                             &app_handle,
@@ -2326,6 +2747,7 @@ fn main() -> Result<()> {
                             return;
                         }
 
+                        // 准备 ALAS 仓库与 Python 运行环境（克隆/更新/依赖同步等耗时步骤）。
                         if let Err(e) = setup_alas_repo(
                             &mut status_updater,
                             setup_cancel_requested.clone(),
@@ -2359,6 +2781,7 @@ fn main() -> Result<()> {
                                 crate::setup::get_tip()
                             )),
                         );
+                        // 后端启动循环：启动超时且未恢复过时，重建 venv 并重试一次。
                         let mut backend_recovery_used = false;
                         let backend_result = loop {
                             match ManagedBackend::new(&webui_config) {
@@ -2422,7 +2845,9 @@ fn main() -> Result<()> {
                                 return;
                             }
                         };
+                        // 后端句柄存入共享状态，退出时统一 terminate。
                         *backend.lock().unwrap() = Some(b);
+                        // 通知点击回调：唤起主窗口（可能在任意线程触发，需调度）。
                         let notification_click: NotificationClickHandler = {
                             let app_handle = app_handle.clone();
                             let recreating_main_window = recreating_main_window_for_notify.clone();
@@ -2434,6 +2859,8 @@ fn main() -> Result<()> {
                                 );
                             })
                         };
+                        // 启动 SSE 通知流与反向控制流：接收后端推送的通知/弹窗
+                        // 与退出指令。
                         start_notify_stream(
                             app_handle.clone(),
                             port,
@@ -2449,6 +2876,7 @@ fn main() -> Result<()> {
                                     crate::setup::get_tip()
                                 )),
                         );
+                        // 一切就绪：销毁 splash，主窗口导航到 WebUI 后按需显示。
                         let _ = splash.destroy();
                         debug!("Destroyed splash window after startup");
 
@@ -2458,6 +2886,7 @@ fn main() -> Result<()> {
                         if let Err(e) = navigate_backend_or_error(&window, port) {
                             error!("Failed to navigate main window: {:?}", e);
                         }
+                        // 最小化启动：后端就绪后仍保持隐藏，仅驻留托盘。
                         if start_minimized {
                             info!("Backend is ready; keeping main window hidden in tray");
                             let _ = window.hide();
@@ -2469,6 +2898,8 @@ fn main() -> Result<()> {
                     });
                 }
                 tauri::RunEvent::ExitRequested { api, .. } => {
+                    // 启动尚未完成时的退出请求（如 splash 阶段被关闭）：
+                    // 先执行启动清理，清理完成后再自行退出。
                     if !setup_completed.load(Ordering::SeqCst)
                         && !startup_cleanup_started.load(Ordering::SeqCst)
                     {
@@ -2486,7 +2917,8 @@ fn main() -> Result<()> {
                     let should_allow = allow_exit.load(Ordering::SeqCst);
                     debug!("ExitRequested event: allow_exit={}", should_allow);
 
-                    // Only exit if explicitly allowed (e.g., via tray menu Quit)
+                    // 仅在显式放行（托盘退出、window_exit_application、Ctrl-C
+                    // 等）时才允许退出；否则阻止退出并把主窗口最小化到托盘。
                     if !should_allow {
                         api.prevent_exit();
                         debug!("Minimizing main window to tray");
@@ -2495,6 +2927,7 @@ fn main() -> Result<()> {
                     }
 
                     debug!("allow_exit is TRUE, proceeding with app shutdown");
+                    // 放行退出：先终止 gui.py 后端进程再结束应用。
                     info!("App exit allowed, shutting down backend...");
                     if let Some(ref mut b) = *backend.lock().unwrap() {
                         if let Err(e) = b.terminate() {
@@ -2502,6 +2935,7 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                // macOS Dock 图标点击重开（Reopen）：恢复主窗口并切回 Regular 策略。
                 #[cfg(target_os = "macos")]
                 tauri::RunEvent::Reopen { .. } => {
                     restore_main_window_from_any_thread(
@@ -2517,6 +2951,7 @@ fn main() -> Result<()> {
                 } => {
                     debug!("Window {} close requested", label);
 
+                    // splash 阶段的关闭请求：启动未完成时转启动清理流程。
                     if label == "splash" && !setup_completed.load(Ordering::SeqCst) {
                         api.prevent_close();
                         begin_startup_cleanup(
@@ -2529,6 +2964,7 @@ fn main() -> Result<()> {
                         return;
                     }
 
+                    // 其余情况下关闭 splash 视为放弃启动：置放行标志并退出。
                     if label == "splash" && !allow_exit.load(Ordering::SeqCst) {
                         api.prevent_close();
                         allow_exit.store(true, Ordering::SeqCst);
@@ -2536,7 +2972,8 @@ fn main() -> Result<()> {
                         return;
                     }
 
-                    // Windows: show the in-window close chooser instead of a native dialog.
+                    // Windows：不弹原生对话框，而是让主窗口打开自带的
+                    // "退出/最小化到托盘"选择菜单；JS 注入缺失时降级为托盘化。
                     #[cfg(windows)]
                     {
                         if label == "main" && !allow_exit.load(Ordering::SeqCst) {
@@ -2555,8 +2992,8 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    // macOS: switch to Accessory policy so the app does not terminate
-                    // when no Regular windows are visible.
+                    // macOS：隐藏窗口并切到 Accessory 策略，避免没有可见常规
+                    // 窗口时应用被判定为应退出。
                     #[cfg(target_os = "macos")]
                     {
                         if label == "main" && !allow_exit.load(Ordering::SeqCst) {
@@ -2566,7 +3003,7 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    // Linux: just hide to tray
+                    // Linux：直接隐藏窗口（不弹确认）。
                     #[cfg(target_os = "linux")]
                     {
                         if label == "main" && !allow_exit.load(Ordering::SeqCst) {
@@ -2583,10 +3020,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// 初始化 tracing 日志：当日文件（log/{日期}_launcher.txt）+ stderr 双输出。
+///
+/// 文件层不带 ANSI 颜色与 target 前缀，便于直接阅读；两层均为 DEBUG 级别。
+/// 返回的 WorkerGuard 必须存活到进程结束，drop 时自动刷盘。
+///
+/// # Errors
+/// 创建或截断日志文件失败时返回 Err。
 fn initialize_logging() -> Result<WorkerGuard> {
     let log_dir = Path::new("log");
     let log_filename = today_launcher_log_filename();
     truncate_log_file(log_dir, &log_filename)?;
+    // rolling::never 不做按时间/大小轮转，固定写当日文件（启动时已先截断）。
     let file_appender = tracing_appender::rolling::never(log_dir, log_filename);
     let (non_blocking_file, guard) = tracing_appender::non_blocking(file_appender);
 
@@ -2607,6 +3052,11 @@ fn initialize_logging() -> Result<WorkerGuard> {
     Ok(guard)
 }
 
+/// 确保日志目录存在并把日志文件截断为空（File::create 语义）。
+/// 每次启动重新记录，避免单文件无限增长。
+///
+/// # Errors
+/// 目录创建或文件创建失败时返回 Err。
 fn truncate_log_file(log_dir: &Path, filename: &str) -> Result<()> {
     fs::create_dir_all(log_dir)?;
     let path = log_dir.join(filename);
@@ -2615,9 +3065,14 @@ fn truncate_log_file(log_dir: &Path, filename: &str) -> Result<()> {
     Ok(())
 }
 
+/// Tauri 命令：由注入的 window.saveAs 调用（见 page_load_injector）。
+///
+/// 前端传入文件名与 base64 编码的文件内容，此处解码后弹出系统"另存为"
+/// 对话框并写盘。无返回值，失败仅记录日志。
 #[tauri::command]
 fn save_as(app_handle: tauri::AppHandle, filename: &str, data: &str) {
     match BASE64_STANDARD.decode(data) {
+        // 解码成功：弹出系统"另存为"对话框；写盘在回调中完成，失败只记日志。
         Ok(decoded_data) => app_handle
             .dialog()
             .file()
@@ -2642,11 +3097,15 @@ fn save_as(app_handle: tauri::AppHandle, filename: &str, data: &str) {
     }
 }
 
+/// Tauri 命令：把今天的 GUI 日志（log/{日期}_gui.txt）另存到用户选择的位置。
+/// 返回被保存的文件名；读取失败时返回错误字符串。
 #[tauri::command]
 fn download_today_gui_log(app_handle: tauri::AppHandle) -> std::result::Result<String, String> {
     download_log_file(app_handle, today_gui_log_filename(), "GUI")
 }
 
+/// Tauri 命令：把今天的启动器日志（log/{日期}_launcher.txt）另存到用户
+/// 选择的位置。返回被保存的文件名；读取失败时返回错误字符串。
 #[tauri::command]
 fn download_today_launcher_log(
     app_handle: tauri::AppHandle,
@@ -2654,6 +3113,11 @@ fn download_today_launcher_log(
     download_log_file(app_handle, today_launcher_log_filename(), "launcher")
 }
 
+/// 读取指定日志文件并弹出另存为对话框。
+///
+/// # Errors
+/// 以 Err(String) 返回（前端直接展示）：获取工作目录或读取日志文件失败时
+/// 携带本地化错误文案；保存对话框是异步的，写盘失败只记日志。
 fn download_log_file(
     app_handle: tauri::AppHandle,
     filename: String,
@@ -2695,25 +3159,32 @@ fn download_log_file(
     Ok(filename)
 }
 
+/// 生成今天的 GUI 日志文件名（{日期}_gui.txt，日期取本地时区）。
 fn today_gui_log_filename() -> String {
     format!("{}_gui.txt", Local::now().format("%Y-%m-%d"))
 }
 
+/// 生成今天的启动器日志文件名（{日期}_launcher.txt，日期取本地时区）。
 fn today_launcher_log_filename() -> String {
     format!("{}_launcher.txt", Local::now().format("%Y-%m-%d"))
 }
 
+/// Tauri 命令：隐藏主窗口并最小化到托盘（自定义标题栏的"托盘化"按钮与
+/// 关闭选择菜单的"最小化到托盘"选项均调用此命令）。
 #[tauri::command]
 fn window_hide(app_handle: tauri::AppHandle) -> tauri::Result<()> {
     minimize_main_window_to_tray(&app_handle);
     Ok(())
 }
 
+/// Tauri 命令：最小化窗口到任务栏（splash 与标题栏的最小化按钮调用）。
 #[tauri::command]
 fn window_minimize(window: WebviewWindow) -> tauri::Result<()> {
     window.minimize()
 }
 
+/// Tauri 命令：切换窗口最大化/还原状态。
+/// 返回切换后是否处于最大化，供标题栏按钮同步图标。
 #[tauri::command]
 fn window_toggle_maximize(window: WebviewWindow) -> tauri::Result<bool> {
     if window.is_maximized()? {
@@ -2725,11 +3196,15 @@ fn window_toggle_maximize(window: WebviewWindow) -> tauri::Result<bool> {
     }
 }
 
+/// Tauri 命令：关闭窗口（splash 的关闭按钮调用；主窗口的关闭行为由
+/// RunEvent::WindowEvent 的 CloseRequested 分支按平台处理）。
 #[tauri::command]
 fn window_close(window: WebviewWindow) -> tauri::Result<()> {
     window.close()
 }
 
+/// Tauri 命令：用户在关闭选择菜单确认退出时调用——置位放行标志并以
+/// 退出码 0 结束应用，使 ExitRequested 分支放行真正的关停（含终止后端）。
 #[tauri::command]
 fn window_exit_application(
     app_handle: tauri::AppHandle,
@@ -2740,16 +3215,26 @@ fn window_exit_application(
     Ok(())
 }
 
+/// Tauri 命令：开始拖动窗口（标题栏拖拽区与 splash 拖拽区调用）。
 #[tauri::command]
 fn window_start_dragging(window: WebviewWindow) -> tauri::Result<()> {
     window.start_dragging()
 }
 
+/// Tauri 命令：查询窗口当前是否处于最大化（标题栏按钮同步图标用）。
 #[tauri::command]
 fn window_is_maximized(window: WebviewWindow) -> tauri::Result<bool> {
     window.is_maximized()
 }
 
+/// Tauri 命令：错误页面的"重试连接"按钮（含每秒自动重试）调用。
+///
+/// 在阻塞线程中等待后端端口恢复可达，随后换发免密令牌并导航过去；
+/// 超时未恢复返回 Ok(false)（前端提示"仍然失败"），恢复并成功导航返回
+/// Ok(true)。
+///
+/// # Errors
+/// 以 Err(String) 返回：阻塞任务失败、URL 解析或导航失败时携带错误信息。
 #[tauri::command]
 async fn retry_backend_connection(
     window: WebviewWindow,
@@ -2780,7 +3265,13 @@ async fn retry_backend_connection(
     Ok(true)
 }
 
+/// 页面加载完成回调：向主窗口页面注入启动器辅助 JS。
+///
+/// 注入内容（一个幂等的 IIFE）：阻止浏览器历史后退；把 window.saveAs
+/// 覆盖为"经 FileReader 转 base64 后调用 Tauri save_as 命令"的版本；并
+/// 拼入自定义标题栏脚本（macOS 除外，见 main_window_titlebar_injection_script）。
 fn page_load_injector(webview: WebviewWindow, payload: PageLoadPayload<'_>) {
+    // 只在加载完成（Finished）时注入：开始加载阶段文档尚未就绪，注入无效。
     if payload.event() == PageLoadEvent::Finished {
         info!(
             "Injecting saveFile function to loaded page: {}",
@@ -2818,12 +3309,15 @@ __ALAS_TITLEBAR_SCRIPT__
             "__ALAS_TITLEBAR_SCRIPT__",
             &main_window_titlebar_injection_script(),
         );
+        // 注入失败不影响页面本身功能，仅记录日志。
         if let Err(e) = webview.eval(&injected_js) {
             error!("Failed to inject JS to webview: {:?}", e);
         }
     }
 }
 
+/// 初始化 splash 窗口：导航到 alas-splash:// 页面，等待页面脚本就绪后按需
+/// 显示窗口。就绪探测超时也照样显示，保证用户总能看到启动画面。
 fn initialize_splash(splash: &WebviewWindow, show_window: bool) {
     match Url::parse(SPLASH_URL) {
         Ok(url) => {
@@ -2833,6 +3327,7 @@ fn initialize_splash(splash: &WebviewWindow, show_window: bool) {
             if !wait_for_splash_ready(splash, Duration::from_secs(2)) {
                 warn!("Timed out waiting for splash page readiness; showing splash anyway");
             }
+            // show_window 为 false 对应最小化启动：先不显示，等后端就绪再唤起。
             if show_window {
                 if let Err(e) = splash.show() {
                     error!("Failed to show splash window: {:?}", e);
@@ -2845,6 +3340,8 @@ fn initialize_splash(splash: &WebviewWindow, show_window: bool) {
     }
 }
 
+/// 轮询探测 splash 页面是否就绪：执行一段检查 __ALAS_SPLASH_READY 标志的
+/// JS，eval 成功即认为页面的更新回调已挂好、可以接收进度推送。
 fn wait_for_splash_ready(splash: &WebviewWindow, timeout: Duration) -> bool {
     let started_at = Instant::now();
     while started_at.elapsed() < timeout {
@@ -2860,11 +3357,14 @@ fn wait_for_splash_ready(splash: &WebviewWindow, timeout: Duration) -> bool {
         {
             return true;
         }
+        // 25ms 轮询：足够灵敏且不给 WebView 造成明显压力。
         thread::sleep(Duration::from_millis(25));
     }
     false
 }
 
+/// 把 SplashUpdate 序列化为 JSON 并调用 splash 页面的
+/// window.__ALAS_SPLASH_UPDATE 回调刷新界面。
 fn update_splash(splash: &WebviewWindow, update: &SplashUpdate) {
     let payload = to_string(update).unwrap();
     let script = format!("window.__ALAS_SPLASH_UPDATE && window.__ALAS_SPLASH_UPDATE({payload});");
@@ -2873,10 +3373,13 @@ fn update_splash(splash: &WebviewWindow, update: &SplashUpdate) {
     }
 }
 
+/// 拼接后端 WebUI 的本地地址（http://127.0.0.1:{port}/）。
 fn backend_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/")
 }
 
+/// 构造 alas-splash:// 协议的 HTML 响应：视频背景与字体以 base64 内嵌，
+/// 无外部资源依赖，保证离线首屏可用。
 fn splash_response() -> tauri::http::Response<Vec<u8>> {
     let video_bg_b64 = BASE64_STANDARD.encode(SPLASH_BG_VIDEO);
     let mi_sans_font_b64 = BASE64_STANDARD.encode(MI_SANS_FONT);
@@ -2889,6 +3392,10 @@ fn splash_response() -> tauri::http::Response<Vec<u8>> {
         .unwrap()
 }
 
+/// 用一次 TCP 连接探测后端端口是否可达。
+///
+/// # Errors
+/// 地址解析失败或连接超时（BACKEND_CONNECT_TIMEOUT）时返回 Err。
 fn check_backend_connection(port: u16) -> Result<()> {
     let address: SocketAddr = format!("127.0.0.1:{port}").parse()?;
     TcpStream::connect_timeout(&address, BACKEND_CONNECT_TIMEOUT)
@@ -2914,6 +3421,13 @@ fn backend_unready_error(timeout_error: anyhow::Error, reason: Option<String>) -
     }
 }
 
+/// 在给定时限内轮询后端端口直到可达。
+///
+/// 每 200ms 探测一次；超时后把最后一次连接错误与后端日志中发现的失败
+/// 原因合成最终错误（见 backend_unready_error）。
+///
+/// # Errors
+/// 超时仍不可达时返回 Err（附带最后一次连接错误与可能的后端失败原因）。
 fn wait_for_backend_connection(port: u16, timeout: Duration) -> Result<()> {
     let started_at = Instant::now();
     let mut last_error = None;
@@ -2934,6 +3448,14 @@ fn wait_for_backend_connection(port: u16, timeout: Duration) -> Result<()> {
     ))
 }
 
+/// 等待后端就绪后把窗口导航到 WebUI（必要时带免密令牌）；失败则导航到
+/// alas-error:// 错误页面。
+///
+/// # Returns
+/// Ok(true) 表示已导航到后端；Ok(false) 表示后端不可达、已转错误页面。
+///
+/// # Errors
+/// 仅当错误页导航本身失败（URL 解析或 WebView 导航出错）时返回 Err。
 fn navigate_backend_or_error(window: &WebviewWindow, port: u16) -> Result<bool> {
     match wait_for_backend_connection(port, BACKEND_NAVIGATION_TIMEOUT) {
         Ok(()) => {
@@ -2949,12 +3471,20 @@ fn navigate_backend_or_error(window: &WebviewWindow, port: u16) -> Result<bool> 
     }
 }
 
+/// 把窗口导航到携带端口与错误详情的 alas-error:// 错误页面。
+///
+/// # Errors
+/// 错误 URL 构造或导航失败时返回 Err。
 fn navigate_to_backend_error(window: &WebviewWindow, port: u16, error_detail: &str) -> Result<()> {
     let url = backend_error_url(port, error_detail)?;
     window.navigate(url)?;
     Ok(())
 }
 
+/// 构造错误页面 URL：port 与错误详情作为 query 参数，经 URL 编码安全传递。
+///
+/// # Errors
+/// URL 解析失败时返回 Err（基路径是编译期常量，正常不会失败）。
 fn backend_error_url(port: u16, error_detail: &str) -> Result<Url> {
     let port = port.to_string();
     Ok(Url::parse_with_params(
@@ -2963,6 +3493,7 @@ fn backend_error_url(port: u16, error_detail: &str) -> Result<Url> {
     )?)
 }
 
+/// alas-error:// 协议处理器：从请求 URI 解析 port/detail，返回错误页 HTML。
 fn backend_error_response(
     request: tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Vec<u8>> {
@@ -2978,6 +3509,9 @@ fn backend_error_response(
         .unwrap()
 }
 
+/// 从错误页请求 URI 中提取 port 与 detail query 参数。
+///
+/// 缺省值为默认端口 22267 与通用"无法连接"文案；非法端口直接忽略。
 fn backend_error_request_params(uri: &str) -> (u16, String) {
     let mut port = 22267;
     let mut detail = t!("error_page.unable_connect").to_string();
@@ -2999,6 +3533,11 @@ fn backend_error_request_params(uri: &str) -> (u16, String) {
     (port, detail)
 }
 
+/// 主窗口导航拦截：目标不是后端地址时放行；是后端地址但连接不上时阻止
+/// 本次导航，并异步把窗口切到错误页面。
+///
+/// # Returns
+/// true 表示放行导航，false 表示已拦截。
 fn handle_backend_navigation(app: tauri::AppHandle, port: u16, url: &Url) -> bool {
     if !is_backend_url(url, port) {
         return true;
@@ -3013,6 +3552,7 @@ fn handle_backend_navigation(app: tauri::AppHandle, port: u16, url: &Url) -> boo
                 blocked_url, e
             );
             let error_detail = e.to_string();
+            // 在独立线程里切换到错误页，避免在导航回调内同步改写导航目标。
             thread::spawn(move || {
                 if let Some(window) = app.get_webview_window("main") {
                     if let Err(e) = navigate_to_backend_error(&window, port, &error_detail) {
@@ -3025,12 +3565,14 @@ fn handle_backend_navigation(app: tauri::AppHandle, port: u16, url: &Url) -> boo
     }
 }
 
+/// 判断 URL 是否指向本地后端：http/https + 127.0.0.1/localhost + 目标端口。
 fn is_backend_url(url: &Url, port: u16) -> bool {
     matches!(url.scheme(), "http" | "https")
         && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"))
         && url.port_or_known_default() == Some(port)
 }
 
+/// 转义 HTML 特殊字符（& < > " '），用于把本地化文案安全嵌入 HTML。
 fn escape_html(input: impl AsRef<str>) -> String {
     input
         .as_ref()
@@ -3041,6 +3583,11 @@ fn escape_html(input: impl AsRef<str>) -> String {
         .replace('\'', "&#39;")
 }
 
+/// 生成 alas-error:// 错误页面的完整 HTML。
+///
+/// 页面包含：内嵌字体与 splash 视频背景、后端地址与错误详情展示、"重试"
+/// 按钮（页面 JS 每秒自动重试一次）、GUI/启动器日志下载按钮。标题栏脚本
+/// 同样注入，保持无边框窗口可拖拽；本地化文案以 JSON 注入前端。
 fn backend_error_html(port: u16, error_detail: &str) -> String {
     let backend_url_json = to_string(&backend_url(port)).unwrap();
     let error_detail_json = to_string(error_detail).unwrap();
@@ -3065,6 +3612,8 @@ fn backend_error_html(port: u16, error_detail: &str) -> String {
     });
     let i18n_json = to_string(&i18n).unwrap();
 
+    // HTML/CSS/JS 内的字面大括号在 format! 里需双写转义；文案经 JSON 注入
+    // 避免引号/换行破坏 HTML 结构。
     format!(
         r#"<!doctype html>
 <html>
@@ -3452,7 +4001,14 @@ fn backend_error_html(port: u16, error_detail: &str) -> String {
     )
 }
 
+/// 生成 splash 启动画面的完整 HTML 外壳。
+///
+/// 包含：视频背景、自定义红绿灯窗口按钮（最小化/关闭）、顶部拖拽区、
+/// 主进度条（含可选的 uv 安装进度子条）、错误态样式与"下载日志"按钮。
+/// 静态占位符经 replace 注入：base64 资源、版本号、本地化 JSON 与文案、
+/// 以及仅 Windows 启用的原生触摸拖拽开关。
 fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> String {
+    // 页面文案聚合为 JSON 注入，前端按 key 取用，避免逐个拼接转义。
     let i18n = serde_json::json!({
         "defaultTip": t!("tips.17"),
         "loading": t!("splash.loading_badge"),
@@ -4191,6 +4747,9 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
   </script>
 </body>
 </html>"#
+    // 占位符替换：$PROGRESS_HEAD/$VIDEO_BG/$MI_SANS_FONT 为 base64 资源，
+    // $LAUNCHER_VERSION 版本号，$I18N_* 为本地化文案（已 HTML 转义），
+    // $NATIVE_TOUCH_DRAG 仅 Windows 为 true（WebView2 原生拖拽区域开关）。
     .replace("$PROGRESS_HEAD", &BASE64_STANDARD.encode(SPLASH_PROGRESS_HEAD))
     .replace("$VIDEO_BG", video_bg_b64)
     .replace("$MI_SANS_FONT", mi_sans_font_b64)
@@ -4207,6 +4766,13 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     .replace("$I18N_DOWNLOAD_LOG", &escape_html(t!("splash.download_log")))
 }
 
+/// 按 tauri.conf.json 中 label 为 main 的配置创建主窗口。
+///
+/// 挂载导航拦截（handle_backend_navigation）与页面加载注入
+/// （page_load_injector）。
+///
+/// # Errors
+/// 配置缺失或窗口构建失败时返回 Err。
 fn create_main_window(app: &tauri::AppHandle, port: u16) -> Result<WebviewWindow> {
     let main_config = app
         .config()
@@ -4223,8 +4789,8 @@ fn create_main_window(app: &tauri::AppHandle, port: u16) -> Result<WebviewWindow
         .build()?;
     main_window.set_resizable(true)?;
 
-    // Windows/Linux: remove native decorations for the main window as well.
-    // Splash is configured as borderless in tauri.conf.json.
+    // Windows/Linux：主窗口同样去掉原生装饰（无边框，配合注入的标题栏）；
+    // splash 则已在 tauri.conf.json 中配置为无边框。
     #[cfg(not(target_os = "macos"))]
     {
         main_window.set_decorations(false)?;
@@ -4233,6 +4799,10 @@ fn create_main_window(app: &tauri::AppHandle, port: u16) -> Result<WebviewWindow
     Ok(main_window)
 }
 
+/// 显示窗口并聚焦；若窗口处于最小化状态先还原。
+///
+/// # Errors
+/// 任一窗口操作失败时返回 Err。
 fn reveal_window(window: &WebviewWindow) -> tauri::Result<()> {
     if window.is_minimized()? {
         window.unminimize()?;
@@ -4242,6 +4812,11 @@ fn reveal_window(window: &WebviewWindow) -> tauri::Result<()> {
     Ok(())
 }
 
+/// 把主窗口最小化到托盘（按平台采取不同策略）。
+///
+/// 平台差异：Windows 上直接销毁窗口以释放 WebView 资源（恢复时重建）；
+/// macOS/Linux 仅隐藏窗口；macOS 额外切换到 Accessory 激活策略以隐藏
+/// Dock 图标。
 fn minimize_main_window_to_tray(app: &tauri::AppHandle) {
     #[cfg(windows)]
     {
@@ -4266,6 +4841,7 @@ fn minimize_main_window_to_tray(app: &tauri::AppHandle) {
     }
 }
 
+/// 任意线程安全地调度主窗口恢复：包装 run_on_main_thread，调度失败仅告警。
 fn restore_main_window_from_any_thread(
     app: tauri::AppHandle,
     port: u16,
@@ -4279,6 +4855,8 @@ fn restore_main_window_from_any_thread(
     }
 }
 
+/// 从托盘恢复主窗口：窗口仍存在则直接显示并聚焦；已被销毁（Windows 托盘
+/// 化会销毁窗口）则以防重入标志保护，在新线程中重建并导航。
 fn restore_main_window_from_tray(
     app: &tauri::AppHandle,
     port: u16,
@@ -4291,6 +4869,7 @@ fn restore_main_window_from_tray(
         return;
     }
 
+    // 防重入：托盘、单实例、通知点击可能并发触发，只允许一次重建。
     if recreating_main_window
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -4299,8 +4878,10 @@ fn restore_main_window_from_tray(
         return;
     }
 
+    // 重建在新线程执行：窗口构建与导航可能耗时，不能阻塞调用线程。
     let app_handle = app.clone();
     thread::spawn(move || {
+        // 重建期间同样先把 macOS 切回 Regular，保证 Dock 图标即时出现。
         #[cfg(target_os = "macos")]
         set_macos_activation_policy(&app_handle, true);
 
@@ -4311,6 +4892,7 @@ fn restore_main_window_from_tray(
             Ok(())
         })();
 
+        // 无论成败都复位重建标志，允许后续再次触发。
         recreating_main_window.store(false, Ordering::SeqCst);
 
         if let Err(e) = result {
@@ -4319,6 +4901,8 @@ fn restore_main_window_from_tray(
     });
 }
 
+/// 托盘"显示/隐藏"菜单与左键点击的入口：按当前窗口状态在托盘化与恢复
+/// 之间切换；窗口不存在时走恢复（重建）路径。
 fn toggle_main_window_visibility(
     app: &tauri::AppHandle,
     port: u16,
@@ -4337,13 +4921,24 @@ fn toggle_main_window_visibility(
     }
 }
 
+/// 生成注入主窗口的自定义标题栏 JS 脚本。
+///
+/// 脚本职责：在页面顶部叠加拖拽区，右上角放置"最小化/最大化/关闭"按钮
+/// 胶囊（样式随页面深色主题自动切换）；关闭按钮在 Windows 上打开窗口内
+/// "退出 / 最小化到托盘"选择菜单，其它平台直接调用 window_close；双击
+/// 标题栏切换最大化。按钮动作全部经 Tauri 命令完成。脚本还会定位页面
+/// 已有的 topbar/header 元素同步高度与偏移，并监听主题与窗口尺寸变化。
+///
+/// 平台差异：macOS 返回空脚本——系统自带红绿灯按钮，无需自绘标题栏。
 fn main_window_titlebar_injection_script() -> String {
+    // macOS：系统自带红绿灯按钮，无需注入自绘标题栏。
     #[cfg(target_os = "macos")]
     {
         String::new()
     }
     #[cfg(not(target_os = "macos"))]
     {
+        // 标题栏文案以 JSON 注入，避免字符串拼接时的转义问题。
         let i18n = serde_json::json!({
             "hideLabel": t!("titlebar.minimize_to_tray"),
             "minimizeLabel": t!("titlebar.minimize_window"),
@@ -4364,11 +4959,14 @@ fn main_window_titlebar_injection_script() -> String {
         let mut s = String::with_capacity(8192);
         s.push_str("const i18n = ");
         s.push_str(&i18n_json);
+        // 关闭确认菜单仅 Windows 启用；其余平台保持单击直接关闭的行为。
         s.push_str(if cfg!(windows) {
             ";const closePromptEnabled = true;"
         } else {
             ";const closePromptEnabled = false;"
         });
+        // 以下为原样注入的 JS 主体：创建标题栏 DOM 与样式、绑定拖拽和按钮
+        // 事件、同步页面主题与布局。
         s.push_str(r#";
         const invoke =
             (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)

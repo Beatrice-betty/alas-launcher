@@ -1,3 +1,17 @@
+//! 环境搭建模块：负责 AzurPilot 运行所需的完整环境生命周期。
+//!
+//! 主要职责（由 main.rs 在启动画面阶段的后台线程调用）：
+//! - 定位 AzurLaneAutoScript 仓库目录并切换工作目录；
+//! - 通过内嵌/系统 uv 安装 Python 3.14.6、创建可重定位 `.venv`，
+//!   并将 uv / git / adb 一并部署进 `.venv`（`ensure_runtime_tools`）；
+//! - 经 git 拉取最新仓库代码（`git_update`，最多重试 20 次）；
+//! - 按 `uv.lock` 同步 Python 依赖（`uv_sync_project`）；
+//! - 迁移与校验 `config/deploy.yaml` 部署配置（`migrate_dependency_config`）；
+//! - 清理可重建的运行时状态（`.venv`、缓存）用于故障恢复。
+//!
+//! 阶段进度通过 [`SplashUpdate`] 回调上报启动画面；所有长时间操作均支持
+//! 经 `cancel_requested` 原子标志请求取消。
+
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Local;
 use reqwest::blocking::Client;
@@ -23,24 +37,38 @@ use tracing::{info, warn};
 use crate::window_util::CreateNoWindow as _;
 use rust_i18n::t;
 
+/// 启动画面的单次进度更新载荷。
+///
+/// 由 setup 各阶段构造，推送到 `alas-splash://` 页面的
+/// `window.__ALAS_SPLASH_UPDATE()`，驱动标题、进度条与提示文案。
 #[derive(Clone, Debug, Serialize)]
 pub struct SplashUpdate {
+    /// 副标题，展示随机小贴士或阶段说明。
     pub subtitle: String,
+    /// 阶段主标题（如"更新中""安装依赖"）。
     pub title: String,
+    /// 具体进度描述（当前正在执行的动作）。
     pub detail: String,
+    /// 总进度百分比（0-100，超界值会被钳制）。
     pub progress: u8,
+    /// uv 依赖同步的独立子进度；仅在 uv sync 阶段存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uv_progress: Option<UvProgress>,
+    /// 是否为错误状态（启动画面据此切换错误配色与文案）。
     pub is_error: bool,
 }
 
+/// uv 依赖同步的子进度（进度条内嵌的独立分段）。
 #[derive(Clone, Debug, Serialize)]
 pub struct UvProgress {
+    /// uv 阶段的进度百分比（0-100）。
     pub progress: u8,
+    /// uv 阶段的描述（解析/下载/安装状态与速度估算）。
     pub detail: String,
 }
 
 impl SplashUpdate {
+    /// 构造一条"进行中"的启动画面进度，副标题固定为 i18n 的连接中文案。
     pub fn loading(title: impl Into<String>, detail: impl Into<String>, progress: u8) -> Self {
         Self {
             subtitle: t!("setup.connecting").to_string(),
@@ -52,6 +80,7 @@ impl SplashUpdate {
         }
     }
 
+    /// 构造一条"失败"的启动画面进度，启动画面将切换为错误展示样式。
     pub fn error(title: impl Into<String>, detail: impl Into<String>, progress: u8) -> Self {
         Self {
             subtitle: t!("setup.connection_failed").to_string(),
@@ -63,11 +92,13 @@ impl SplashUpdate {
         }
     }
 
+    /// 覆盖副标题文案（如随机小贴士）。
     pub fn with_subtitle(mut self, subtitle: impl Into<String>) -> Self {
         self.subtitle = subtitle.into();
         self
     }
 
+    /// 附加 uv 同步子进度（独立进度值与阶段描述）。
     pub fn with_uv_progress(mut self, progress: u8, detail: impl Into<String>) -> Self {
         self.uv_progress = Some(UvProgress {
             progress: progress.min(100),
@@ -77,8 +108,10 @@ impl SplashUpdate {
     }
 }
 
+/// 启动画面小贴士总数，需与 locales 中 `tips.*` 键的数量保持一致。
 const TIPS_COUNT: usize = 19;
 
+/// 随机取一条启动画面小贴士（按当前时间戳取模轮换）。
 pub fn get_tip() -> String {
     let now = Local::now().timestamp() as usize;
     let idx = now % TIPS_COUNT;
@@ -86,30 +119,46 @@ pub fn get_tip() -> String {
     t!(&key).to_string()
 }
 
+/// 脚本执行的阶段细分，用于在总进度中区分 git 更新与依赖同步两段。
 #[derive(Clone, Copy, Debug)]
 enum ScriptPhase {
+    /// git 拉取仓库代码阶段。
     Git,
+    /// uv 依赖同步阶段。
     Dependencies,
 }
 
+/// git 更新阶段的累计进度状态。
 #[derive(Default)]
 struct GitProgressState {
+    /// 当前累计进度百分比。
     progress: u8,
 }
 
+/// uv sync 输出解析状态机：跟踪解析/下载/安装各阶段并估算整体进度。
 struct UvProgressState {
+    /// uv 进程启动时刻，用于计算整体耗时与速率。
     started_at: Instant,
+    /// 首个包开始下载的时刻（用于估算下载速度）。
     download_started_at: Option<Instant>,
+    /// 各包体积（字节），用于按量加权估算总进度。
     package_sizes: HashMap<String, u64>,
+    /// 已完成下载的包名集合（去重，避免重复计数）。
     downloaded_packages: HashSet<String>,
+    /// 累计已下载字节数。
     downloaded_bytes: u64,
+    /// 依赖解析是否已完成。
     resolved: bool,
+    /// 包准备（下载）是否已完成。
     prepared: bool,
+    /// 安装是否已完成。
     installed: bool,
+    /// 上一次上报的进度，用于保证进度单调不回退。
     last_progress: u8,
 }
 
 impl UvProgressState {
+    /// 创建初始状态；进度从 2% 起步，0-2 预留给 uv 启动前的准备工作。
     fn new() -> Self {
         Self {
             started_at: Instant::now(),
@@ -125,11 +174,18 @@ impl UvProgressState {
     }
 }
 
+/// git 更新的最大重试次数：网络抖动时自动重试，20 次（约 20 秒）已能覆盖常见短暂断网。
 const MAX_UPDATE_RETRIES: usize = 20;
+/// 每次重试之间的固定间隔。
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+/// 删除 `.venv` 等目录时的最大重试次数（文件被占用时按退避间隔重试）。
 const CLEANUP_RETRIES: usize = 20;
+/// 内置 Python 解释器版本，需与 CI 打包及 uv 安装的版本保持一致。
 const PYTHON_VERSION: &str = "3.14.6";
+/// 可复用 `.venv` 的最低 Python 版本：低于此版本说明环境过旧，直接删除重建以保证一致性。
 const MIN_REUSABLE_VENV_PYTHON_VERSION: (u16, u16, u16) = (3, 14, 5);
+/// uv 安装 Python standalone 的默认镜像列表：前两条为国内镜像用于加速，
+/// 后两条为官方源兜底；按顺序尝试直到成功。
 const DEFAULT_UV_PYTHON_INSTALL_MIRRORS: &[&str] = &[
     "https://registry.npmmirror.com/-/binary/python-build-standalone/",
     "https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone/",
@@ -137,15 +193,20 @@ const DEFAULT_UV_PYTHON_INSTALL_MIRRORS: &[&str] = &[
     "https://downloads.astral.sh/python/",
     "https://github.com/astral-sh/python-build-standalone/releases/download/",
 ];
+/// 默认 PyPI 索引（国际源）。
 const DEFAULT_PYPI_INDEX: &str = "https://pypi.org/simple/";
+/// 内置的国内 PyPI 镜像列表：国际源不可用时按顺序回退。
 const BUILTIN_PYPI_INDEXES: &[&str] = &[
     "https://mirrors.aliyun.com/pypi/simple/",
     "https://mirrors.cloud.tencent.com/pypi/simple/",
     "https://repo.huaweicloud.com/repository/pypi/simple/",
     "https://mirrors.cernet.edu.cn/pypi/web/simple/",
 ];
+/// 编译期内嵌的 uv 引导二进制：由 build.rs 依据 `ALAS_BOOTSTRAP_UV` 写入；
+/// 空文件表示本地开发构建未内嵌，运行时回退到 `UV` 环境变量或 PATH 中的 uv。
 const BOOTSTRAP_UV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bootstrap_uv.bin"));
 
+/// 读取当前平台对应的内置 deploy.yaml 基线内容（编译期嵌入）。
 fn default_deploy_config() -> &'static str {
     #[cfg(windows)]
     {
@@ -161,6 +222,7 @@ fn default_deploy_config() -> &'static str {
     }
 }
 
+/// 返回 deploy.yaml 中 Python 可执行文件的平台约定路径（.venv 内相对路径）。
 fn platform_python_config_path() -> &'static str {
     if cfg!(windows) {
         "./.venv/Scripts/python.exe"
@@ -169,6 +231,7 @@ fn platform_python_config_path() -> &'static str {
     }
 }
 
+/// 返回 deploy.yaml 中 adb 可执行文件的平台约定路径。
 fn platform_adb_config_path() -> &'static str {
     if cfg!(windows) {
         "./.venv/Scripts/adb.exe"
@@ -177,6 +240,7 @@ fn platform_adb_config_path() -> &'static str {
     }
 }
 
+/// 返回 deploy.yaml 中 git 可执行文件的平台约定路径。
 fn platform_git_config_path() -> &'static str {
     if cfg!(windows) {
         "./.venv/Scripts/git/cmd/git.exe"
@@ -185,8 +249,17 @@ fn platform_git_config_path() -> &'static str {
     }
 }
 
+/// 定位 AzurLaneAutoScript 仓库根目录。
+///
+/// 优先按"便携式同目录发行"查找：启动器可执行文件所在目录若存在
+/// `deploy/installer.py` 即认为是仓库根（Windows/Linux 的常规布局）。
+/// macOS 额外支持 `.app` 包布局：从 `AzurPilot.app/Contents/MacOS`
+/// 回退到 `AzurPilot.app/Contents/AzurLaneAutoScript`。
+///
+/// # Panics
+/// 两种布局都未命中时 panic——启动器必须与仓库同发行，无法继续运行。
 pub fn alas_repo_dir() -> PathBuf {
-    // Always check if this is a typical same-folder portable distribution
+    // 优先检查常规的"同目录便携发行"布局
     let exe_folder = std::env::current_exe()
         .unwrap()
         .parent()
@@ -197,7 +270,7 @@ pub fn alas_repo_dir() -> PathBuf {
     if fs::exists(installer_py).unwrap() {
         return exe_folder;
     }
-    // If it's MacOS, it could be AzurPilot.app/Contents/AzurLaneAutoScript
+    // macOS 需额外考虑 .app 包布局：AzurPilot.app/Contents/AzurLaneAutoScript
     #[cfg(target_os = "macos")]
     {
         use std::ffi::OsStr;
@@ -213,6 +286,10 @@ pub fn alas_repo_dir() -> PathBuf {
     panic!("Cannot find AzurPilot repo folder");
 }
 
+/// 把给定路径前插到指定环境变量（PATH 类）的首位，使其优先级最高。
+///
+/// 用于让 `.venv` 内的工具链（uv/git/adb）压过系统同名工具，
+/// 保证启动流程使用的是受控版本。
 fn prepend_path_to_env(key: &str, path: PathBuf) {
     let mut paths = Vec::new();
     paths.push(path);
@@ -222,10 +299,12 @@ fn prepend_path_to_env(key: &str, path: PathBuf) {
     std::env::set_var(key, std::env::join_paths(paths).unwrap());
 }
 
+/// 仓库内虚拟环境目录：`.venv`（所有平台一致）。
 fn venv_dir() -> PathBuf {
     alas_repo_dir().join(".venv")
 }
 
+/// `.venv` 的可执行文件目录：Windows 为 `Scripts`，Unix 为 `bin`。
 fn venv_bin_dir() -> PathBuf {
     let venv = venv_dir();
     if cfg!(windows) {
@@ -235,6 +314,7 @@ fn venv_bin_dir() -> PathBuf {
     }
 }
 
+/// `.venv` 内 Python 解释器的完整路径。
 pub fn venv_python() -> PathBuf {
     venv_bin_dir().join(if cfg!(windows) {
         "python.exe"
@@ -243,18 +323,23 @@ pub fn venv_python() -> PathBuf {
     })
 }
 
+/// uv managed Python 的实际安装目录（`.venv/python`），与标准 venv 布局并存。
 fn venv_python_install_dir() -> PathBuf {
     venv_dir().join("python")
 }
 
+/// `.venv` 内 uv 的完整路径。
 fn venv_uv() -> PathBuf {
     venv_bin_dir().join(if cfg!(windows) { "uv.exe" } else { "uv" })
 }
 
+/// `.venv` 内 adb 的完整路径。
 fn venv_adb() -> PathBuf {
     venv_bin_dir().join(if cfg!(windows) { "adb.exe" } else { "adb" })
 }
 
+/// `.venv` 内 git 的完整路径；Windows 发行版为 MinGit 完整布局
+/// （`Scripts/git/cmd/git.exe`），Unix 为单文件 `bin/git`。
 fn venv_git() -> PathBuf {
     if cfg!(windows) {
         venv_bin_dir().join("git").join("cmd").join("git.exe")
@@ -263,15 +348,25 @@ fn venv_git() -> PathBuf {
     }
 }
 
+/// git 的 `GIT_EXEC_PATH` 目录（Windows/Unix 发行包布局均含 `libexec/git-core`）。
 fn venv_git_exec_path() -> PathBuf {
     venv_dir().join("libexec").join("git-core")
 }
 
+/// git 模板目录（`share/git-core/templates`），供 `GIT_TEMPLATE_DIR` 使用。
 fn venv_git_template_dir() -> PathBuf {
     venv_dir().join("share").join("git-core").join("templates")
 }
 
+/// 取得本次进程用于引导的 uv 可执行文件路径。
+///
+/// 优先级：内嵌二进制（释放到带进程 ID 的临时目录，避免多实例冲突）>
+/// `UV` 环境变量 > PATH 搜索。本地开发构建未内嵌 uv 时走后两者。
+///
+/// # Errors
+/// 未内嵌且系统上找不到 uv 时返回 Err（提示用户 uv 未找到）。
 fn bootstrap_uv_path() -> Result<PathBuf> {
+    // 临时目录带进程 ID：防止同一台机器并行运行多个启动器实例时互相覆盖
     let dir = std::env::temp_dir().join(format!("azurpilot-bootstrap-{}", std::process::id()));
     fs::create_dir_all(&dir)?;
     let path = dir.join(if cfg!(windows) { "uv.exe" } else { "uv" });
@@ -298,6 +393,7 @@ fn bootstrap_uv_path() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// 在 PATH 各目录中查找可执行文件（Windows 自动尝试 `.exe` 后缀）。
 fn find_on_path(executable: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -316,12 +412,18 @@ fn find_on_path(executable: &str) -> Option<PathBuf> {
     None
 }
 
+/// 建立后续所有子进程的基础环境：切换工作目录到仓库根，
+/// 并把 `.venv` 工具链目录提升到 PATH 最前。
+///
+/// # Errors
+/// 仓库目录不存在或切换工作目录失败时返回 Err。
 pub fn setup_environment() -> Result<()> {
     let dir = alas_repo_dir();
     info!("AzurPilot dir is {:?}", &dir);
     set_current_dir(&dir)?;
     prepend_path_to_env("PATH", venv_bin_dir());
     if cfg!(windows) {
+        // Windows MinGit 布局的 git.exe 藏在 git/cmd 下，需单独加入 PATH
         prepend_path_to_env("PATH", venv_bin_dir().join("git").join("cmd"));
     } else {
         refresh_git_environment();
@@ -329,6 +431,9 @@ pub fn setup_environment() -> Result<()> {
     Ok(())
 }
 
+/// 设置 Unix 发行包 git 所需的环境变量（执行路径与模板目录）。
+///
+/// 仅在对应目录真实存在时设置，避免把不存在的路径传给 git。
 fn refresh_git_environment() {
     let git_exec_path = venv_git_exec_path();
     if git_exec_path.exists() {
@@ -341,6 +446,10 @@ fn refresh_git_environment() {
     }
 }
 
+/// Linux 专用：探测系统 CA 证书并配置给 git。
+///
+/// 内嵌 git 无法自动找到发行版的 CA 证书，git 拉取 HTTPS 仓库会失败；
+/// 此处经 openssl-probe 定位证书文件，同时写入进程环境与仓库本地配置。
 #[cfg(target_os = "linux")]
 fn setup_git_ca_bundle() {
     let cert_file = openssl_probe::probe().cert_file;
@@ -352,15 +461,24 @@ fn setup_git_ca_bundle() {
     }
 }
 
+/// 环境搭建总入口：按序完成工具安装 → 配置迁移 → 仓库更新 → 依赖同步。
+///
+/// 流程与 `deploy/installer.py` 保持一致，各阶段经 `status_updater`
+/// 上报启动画面进度；`cancel_requested` 允许取消窗口随时中止全流程。
+///
+/// # Errors
+/// 任一阶段失败（下载、更新、同步、配置迁移）或用户取消时返回 Err，
+/// 由 main.rs 决定展示错误页面。
 pub fn setup_alas_repo(
     mut status_updater: impl FnMut(SplashUpdate),
     cancel_requested: Arc<AtomicBool>,
     skip_repository_update: bool,
 ) -> Result<()> {
     info!("Starting setup for AzurPilot repository...");
+    // Linux 的内嵌 git 需要显式指定 CA 证书，必须最先配置
     #[cfg(target_os = "linux")]
     setup_git_ca_bundle();
-    // Similar setup to deploy/installer.py
+    // 流程与 deploy/installer.py 保持一致
     status_updater(
         SplashUpdate::loading(
             t!("setup.preparing_workspace"),
@@ -402,6 +520,13 @@ pub fn setup_alas_repo(
     Ok(())
 }
 
+/// 后端启动超时后的恢复流程：删除 `.venv` 并重建、重新同步依赖。
+///
+/// 与完整 setup 不同，此流程跳过 git 更新与配置迁移，只处理
+/// Python 环境，用于"依赖损坏导致后端起不来"的场景兜底。
+///
+/// # Errors
+/// 用户取消、`.venv` 删除失败或依赖同步失败时返回 Err。
 pub fn rebuild_venv_and_sync_dependencies(
     mut status_updater: impl FnMut(SplashUpdate),
     cancel_requested: Arc<AtomicBool>,
@@ -433,16 +558,20 @@ pub fn rebuild_venv_and_sync_dependencies(
     uv_sync_project(&mut status_updater, &bootstrap_uv, &cancel_requested)
 }
 
+/// 读取解析后的 `config/deploy.yaml` 内容；文件缺失或格式错误时返回 `None`。
 pub fn get_deploy_config() -> Option<JsonValue> {
     let config_content = fs::read_to_string("./config/deploy.yaml").ok()?;
     let config: JsonValue = serde_yaml::from_str(&config_content).ok()?;
     Some(config)
 }
 
-/// Remove the rebuildable runtime state so the next launch starts clean.
+/// 清除可重建的运行时状态，让下次启动从干净状态开始。
 ///
-/// Only `.venv`, the repo's `cache/` and the uv cache go. The checkout, `config/` and `log/`
-/// stay, so a failed dependency sync never costs the user a fresh clone.
+/// 只删除 `.venv`、仓库的 `cache/` 与 uv 缓存；代码检出、`config/`
+/// 与 `log/` 均保留——依赖同步失败不应让用户付出重新克隆的代价。
+///
+/// # Errors
+/// 进程清理后目录仍无法删除时返回 Err。
 pub fn reset_venv_for_rebuild() -> Result<()> {
     let repo_dir = alas_repo_dir();
     kill_runtime_processes(&repo_dir);
@@ -453,7 +582,10 @@ pub fn reset_venv_for_rebuild() -> Result<()> {
     Ok(())
 }
 
-/// Delete a rebuildable path, treating an absent one as already clean.
+/// 删除一个可重建的路径；路径不存在视为已清理，直接成功。
+///
+/// # Errors
+/// 删除失败（重试后仍被占用等）时返回 Err。
 fn remove_rebuildable_entry(path: &Path) -> Result<()> {
     if !path.exists() {
         info!("No {} to remove", path.display());
@@ -468,10 +600,15 @@ fn remove_rebuildable_entry(path: &Path) -> Result<()> {
     })
 }
 
+/// 清空 uv 的全局下载缓存，释放磁盘空间。
+///
+/// # Errors
+/// 找不到 uv 引导程序或 `uv cache clean` 执行失败时返回 Err。
 fn clean_uv_cache() -> Result<()> {
     let uv = bootstrap_uv_path()?;
     info!("Cleaning uv cache with {}", uv.display());
     let mut cmd = Command::new(&uv);
+    // UV_NO_PROGRESS 关闭交互式进度输出；清缓存不应受 UV_PYTHON 影响，故移除
     cmd.args(["cache", "clean"])
         .env("UV_NO_PROGRESS", "1")
         .env_remove("UV_PYTHON");
@@ -488,6 +625,11 @@ fn clean_uv_cache() -> Result<()> {
     Ok(())
 }
 
+/// 强制结束所有仍在使用仓库目录的运行时进程（gui.py 等）。
+///
+/// 依据进程的可执行文件路径或工作目录是否位于仓库目录内判定；
+/// 删除 `.venv` 前必须先停掉占用它的进程，否则 Windows 上文件
+/// 被锁定无法删除。
 fn kill_runtime_processes(repo_dir: &Path) {
     let current_pid = std::process::id();
     let sys = sysinfo::System::new_all();
@@ -520,12 +662,23 @@ fn kill_runtime_processes(repo_dir: &Path) {
     thread::sleep(Duration::from_millis(500));
 }
 
+/// 判断 path 是否位于 parent 目录之内（先规范化再比较前缀）。
+///
+/// 规范化可消除 `..`、符号链接等差异；无法规范化（已删除等）
+/// 时保守返回 false。
 fn path_is_inside(path: &Path, parent: &Path) -> bool {
     path.canonicalize()
         .map(|path| path.starts_with(parent))
         .unwrap_or(false)
 }
 
+/// 递归删除目录/文件，删除前先清除只读属性。
+///
+/// Windows 上处于只读属性的文件无法直接删除，需先清位；
+/// 目录按先清空后删除的顺序递归处理。
+///
+/// # Errors
+/// 任一文件或目录删除失败时返回 Err（含 i18n 错误信息）。
 fn remove_runtime_entry(path: &Path) -> Result<()> {
     clear_readonly(path)?;
     if path.is_dir() {
@@ -549,6 +702,12 @@ fn remove_runtime_entry(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 带重试的删除：被杀进程尚未完全释放文件时退避重试。
+///
+/// 每次失败后检查目标是否已消失（可能被并发进程删掉），消失即成功。
+///
+/// # Errors
+/// 重试次数用尽仍失败时返回最后一次的错误。
 fn remove_runtime_entry_with_retry(path: &Path) -> Result<()> {
     let mut last_error = None;
     for attempt in 0..CLEANUP_RETRIES {
@@ -572,6 +731,14 @@ fn remove_runtime_entry_with_retry(path: &Path) -> Result<()> {
     }))
 }
 
+/// 后端恢复流程中删除 `.venv`，删除前做严格的安全校验。
+///
+/// 校验目的：`.venv` 必须是真实目录（不能是符号链接/Reparse Point）
+/// 且规范化后必须位于仓库目录之内——防止环境变量被篡改后
+/// 误删仓库外的任意目录。
+///
+/// # Errors
+/// 用户取消、路径校验不通过或删除失败时返回 Err。
 fn remove_venv_for_backend_recovery(cancel_requested: &AtomicBool) -> Result<()> {
     let repo_dir = alas_repo_dir().canonicalize()?;
     let venv = venv_dir();
@@ -604,6 +771,10 @@ fn remove_venv_for_backend_recovery(cancel_requested: &AtomicBool) -> Result<()>
     })
 }
 
+/// 实际执行 `.venv` 删除（带取消检查与重试），仅记录日志后委托重试逻辑。
+///
+/// # Errors
+/// 用户取消或删除重试用尽仍失败时返回 Err。
 fn remove_venv_path_for_backend_recovery(venv: &Path, cancel_requested: &AtomicBool) -> Result<()> {
     if cancel_requested.load(Ordering::SeqCst) {
         bail!(t!("setup.cancel_cleaning"));
@@ -620,6 +791,13 @@ fn remove_venv_path_for_backend_recovery(venv: &Path, cancel_requested: &AtomicB
     Ok(())
 }
 
+/// 带取消检查与退避重试的删除循环（恢复流程专用）。
+///
+/// 与 [`remove_runtime_entry_with_retry`] 的区别在于每次尝试前后
+/// 都检查取消标志，保证用户取消时能尽快中止。
+///
+/// # Errors
+/// 用户取消或重试用尽仍失败时返回 Err。
 fn remove_venv_entry_with_retry(path: &Path, cancel_requested: &AtomicBool) -> Result<()> {
     let mut last_error = None;
     for attempt in 0..CLEANUP_RETRIES {
@@ -650,6 +828,13 @@ fn remove_venv_entry_with_retry(path: &Path, cancel_requested: &AtomicBool) -> R
     }))
 }
 
+/// 递归删除 `.venv` 内的单个条目（恢复流程专用，逐步检查取消标志）。
+///
+/// 符号链接与 Reparse Point 只删链接本身、不递归目标——防止
+/// `.venv` 内的链接指向目录外时误删外部文件。
+///
+/// # Errors
+/// 用户取消或删除失败时返回 Err。
 fn remove_venv_entry(path: &Path, cancel_requested: &AtomicBool) -> Result<()> {
     if cancel_requested.load(Ordering::SeqCst) {
         bail!(t!("setup.cancel_cleaning"));
@@ -685,6 +870,10 @@ fn remove_venv_entry(path: &Path, cancel_requested: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
+/// 判断给定元数据是否为符号链接或 Windows Reparse Point。
+///
+/// Reparse Point（含 junction）在标准 `is_symlink()` 下不可见，
+/// Windows 需额外检查文件属性位，二者都不应被递归删除。
 fn is_symlink_or_reparse_point(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
@@ -702,6 +891,13 @@ fn is_symlink_or_reparse_point(metadata: &fs::Metadata) -> bool {
     false
 }
 
+/// 删除符号链接或 Reparse Point 本身（不递归目标内容）。
+///
+/// Windows 需区分"指向目录"与"指向文件"两种链接选用不同 API；
+/// Unix 一律按文件链接删除。
+///
+/// # Errors
+/// 删除失败时返回 Err（含 i18n 错误信息）。
 fn remove_venv_link_or_reparse_point(path: &Path, _metadata: &fs::Metadata) -> Result<()> {
     #[cfg(windows)]
     let result = if fs::metadata(path)
@@ -724,6 +920,12 @@ fn remove_venv_link_or_reparse_point(path: &Path, _metadata: &fs::Metadata) -> R
     })
 }
 
+/// 在重试间隔内以 50ms 粒度小步等待，随时响应取消请求。
+///
+/// 不能用一次长 sleep——用户取消后应立刻停止而不是等完整间隔。
+///
+/// # Errors
+/// 等待期间检测到取消请求时返回 Err。
 fn wait_for_venv_recovery_retry(delay: Duration, cancel_requested: &AtomicBool) -> Result<()> {
     let deadline = Instant::now() + delay;
     while Instant::now() < deadline {
@@ -737,6 +939,12 @@ fn wait_for_venv_recovery_retry(delay: Duration, cancel_requested: &AtomicBool) 
     Ok(())
 }
 
+/// 清除路径的只读属性（Windows 删除只读文件前必须先清位）。
+///
+/// 路径已消失时静默成功；非只读时不做任何操作。
+///
+/// # Errors
+/// 属性修改失败时返回 Err。
 fn clear_readonly(path: &Path) -> Result<()> {
     let Ok(metadata) = fs::metadata(path) else {
         return Ok(());
@@ -750,6 +958,13 @@ fn clear_readonly(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 在独立线程中逐块读取子进程输出流，按自定义协议切分事件并转发。
+///
+/// git/uv 的进度输出使用"前缀:内容"格式（如 uv 的 `Resolved: ...`），
+/// 本函数按 ASCII 范围识别可打印字符：遇到非可打印字符（进度条
+/// 回车重绘、二进制块等）立即截断发送，避免进度条刷屏；遇到冒号
+/// 时若发现重复前缀模式则切分出完整事件提前发送。最终每个事件以
+/// `(is_err, 文本)` 形式送入通道，由主循环统一消费。
 fn pipe_lines(read: impl Read + Send + 'static, tx: Sender<(bool, String)>, is_err: bool) {
     thread::spawn(move || {
         let mut reader = BufReader::new(read);
@@ -760,12 +975,14 @@ fn pipe_lines(read: impl Read + Send + 'static, tx: Sender<(bool, String)>, is_e
                 Ok(0) | Err(_) => break,
                 Ok(size) => {
                     for c in &line[0..size] {
+                        // 非 ASCII 可打印字符：视为进度重绘等噪声，截断当前缓冲
                         if *c < 32 || *c > 127 {
                             if !buffer.is_empty() {
                                 let _ = tx.send((is_err, buffer));
                                 buffer = "".to_owned();
                             }
                         } else if *c as char == ':' {
+                            // "A:A..." 形式的重复前缀说明上一事件已完整，切分发送
                             let mut cut = 0usize;
                             if let Some((l, r)) = buffer.split_once(':') {
                                 if r.ends_with(l) {
@@ -791,6 +1008,15 @@ fn pipe_lines(read: impl Read + Send + 'static, tx: Sender<(bool, String)>, is_e
     });
 }
 
+/// 运行一个长时间子命令（git 更新或 uv 同步），实时解析输出并上报进度。
+///
+/// 子进程的 stdout/stderr 各由一个读取线程消费（见 [`pipe_lines`]），
+/// 主循环经通道收取事件：可识别为进度的行驱动启动画面更新，普通
+/// 输出写日志，stderr 行同时记为"最后错误"用于失败时展示。
+/// 依赖阶段在 1 秒无输出时也会发出等待进度，避免画面长时间静止。
+///
+/// # Errors
+/// 用户取消（会先杀掉子进程）、子进程启动失败或非零退出时返回 Err。
 fn run_command(
     cmd: &mut Command,
     mut status_updater: impl FnMut(SplashUpdate),
@@ -805,40 +1031,44 @@ fn run_command(
         .stderr(Stdio::piped())
         .spawn()?;
 
-    // Channels to receive lines from reader threads. (is_err, line)
+    // 接收读取线程输出的通道：(是否 stderr, 行文本)
     let (tx, rx) = mpsc::channel::<(bool, String)>();
 
-    // Spawn a reader thread for stdout
+    // 为 stdout 启动一个读取线程
     if let Some(stdout) = child.stdout.take() {
         pipe_lines(stdout, tx.clone(), false);
     }
 
-    // Spawn a reader thread for stderr
+    // 为 stderr 启动一个读取线程
     if let Some(stderr) = child.stderr.take() {
         pipe_lines(stderr, tx.clone(), true);
     }
 
-    // Drop the original sender so rx will close when both reader threads finish.
+    // 主动丢弃原始 sender：两个读取线程结束后通道即关闭，主循环可退出
     drop(tx);
 
     let mut last_err = "".to_owned();
     let mut git_progress = GitProgressState::default();
     let mut uv_progress = UvProgressState::new();
+    // 依赖阶段起点 64%：前半段留给 git 更新，保证总进度单调
     let mut dependency_progress = 64u8;
     let mut dependency_elapsed_secs = 0u16;
 
-    // Receive lines and tee them to stdout/stderr and the status_updater callback.
+    // 主循环：收取输出行，转发到日志与启动画面进度回调
     loop {
         if cancel_requested.load(Ordering::SeqCst) {
+            // 取消时必须先杀子进程再退出，防止 gui 安装/下载残留
             let _ = child.kill();
             let _ = child.wait();
             bail!(t!("setup.cancel_cleaning"));
         }
+        // 带 1 秒超时收取：超时分支用于在无输出时刷新等待进度
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok((is_err, line)) => {
                 if let Some(mut update) =
                     splash_update_for_output(&line, phase, &mut git_progress, &mut uv_progress)
                 {
+                    // 进度只前进不回退（max 保护），避免输出乱序导致画面跳动
                     if is_deps {
                         update.progress = update.progress.max(dependency_progress);
                         dependency_progress = update.progress;
@@ -847,6 +1077,8 @@ fn run_command(
                 }
 
                 if is_err {
+                    // uv 的进度日志走 stderr，属正常输出降级为 info；
+                    // 其余 stderr 视为错误信息并记住最后一行用于失败提示
                     if is_deps && is_uv_progress_line(&line) {
                         info!("{line}");
                     } else {
@@ -870,14 +1102,16 @@ fn run_command(
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
+                // 两个读取线程都已结束（含 sender 被 drop），子进程输出完毕
                 break;
             }
         }
     }
 
-    // Wait for child to exit and check status
+    // 等待子进程退出并检查退出码
     let status = child.wait()?;
     if !status.success() {
+        // stderr 为空时用阶段默认文案兜底，保证错误提示永远有内容
         if last_err.is_empty() {
             last_err = match phase {
                 ScriptPhase::Git => t!("setup.update_failed").to_string(),
@@ -889,6 +1123,13 @@ fn run_command(
     Ok(())
 }
 
+/// 带重试的命令执行封装：失败后按固定间隔重试至 [`MAX_UPDATE_RETRIES`] 次。
+///
+/// 每次失败都会向启动画面上报"第 N/20 次重试"状态；取消请求在
+/// 每轮循环开头检查。
+///
+/// # Errors
+/// 用户取消或重试用尽仍失败时返回最后一次的错误。
 fn run_command_with_retry(
     build_cmd: impl Fn() -> Command,
     mut status_updater: impl FnMut(SplashUpdate),
@@ -927,6 +1168,13 @@ fn run_command_with_retry(
     unreachable!()
 }
 
+/// 运行子命令并等待退出状态，支持取消，无进度回调。
+///
+/// 供环境搭建流程中的短命令使用（文件复制、目录创建等），
+/// 不解析输出、不上报进度。
+///
+/// # Errors
+/// 用户取消或子进程启动失败时返回 Err（退出码非零由调用方判断）。
 pub fn run_status_command(
     cmd: &mut Command,
     cancel_requested: &AtomicBool,
@@ -934,6 +1182,13 @@ pub fn run_status_command(
     run_status_command_with_tick(cmd, cancel_requested, || {})
 }
 
+/// 带周期回调的 [`run_status_command`] 内部实现。
+///
+/// `on_tick` 在每次轮询（约 100ms）时触发，供调用方刷新
+/// "仍在等待"类的状态展示。
+///
+/// # Errors
+/// 用户取消（先杀子进程）或启动失败时返回 Err。
 fn run_status_command_with_tick(
     cmd: &mut Command,
     cancel_requested: &AtomicBool,
@@ -978,12 +1233,17 @@ fn splash_retry_update(phase: ScriptPhase, retry_count: usize, error_text: &str)
     }
 }
 
+/// 构造依赖同步阶段的起始进度（64%，uv 子进度从 2% 开始解析）。
 fn dependency_start_update() -> SplashUpdate {
     SplashUpdate::loading(t!("setup.installing_deps"), t!("setup.uv_parsing"), 64)
         .with_subtitle(t!("setup.syncing_deps", tip = get_tip()))
         .with_uv_progress(2, t!("setup.uv_resolving", secs = "0"))
 }
 
+/// 构造依赖同步阶段"等待中"的进度（子命令暂时无输出时保持画面活跃）。
+///
+/// 按已等待秒数切换文案（10 秒内显示"解析中"，之后显示已耗时），
+/// 进度取当前值与全局 uv 进度的较大者，保证单调。
 fn dependency_wait_update(
     elapsed_secs: u16,
     current_progress: u8,
@@ -1001,6 +1261,15 @@ fn dependency_wait_update(
         .with_uv_progress(uv_progress.progress(), uv_progress.detail())
 }
 
+/// 经内嵌 Python 脚本调用 `deploy.git.GitManager` 拉取最新仓库代码。
+///
+/// 不直接调用 git，而是复用上游 ALAS 的 Python 更新逻辑，保证更新
+/// 行为（远程配置、冲突处理）与官方安装器一致；脚本会给 `execute`
+/// 打补丁，为 fetch 命令强制加上 `--progress` 以便解析进度条。
+/// 失败时由 [`run_command_with_retry`] 自动重试（最多 20 次）。
+///
+/// # Errors
+/// 用户取消或重试用尽仍失败时返回 Err。
 fn git_update(
     status_updater: impl FnMut(SplashUpdate),
     bootstrap_uv: &Path,
@@ -1036,6 +1305,14 @@ gm.git_install()
     )
 }
 
+/// 按 `uv.lock` 同步 Python 依赖，带 PyPI 镜像源的多级回退。
+///
+/// 依次尝试 [`ranked_pypi_indexes`] 排序后的镜像源：每个源先重锁
+/// `uv.lock` 再同步；同步失败会重锁重试一次，仍失败则换下一个源。
+/// 全部源用尽后返回最后一次错误。
+///
+/// # Errors
+/// 用户取消或所有候选源均失败时返回 Err。
 fn uv_sync_project(
     mut status_updater: impl FnMut(SplashUpdate),
     bootstrap_uv: &Path,
@@ -1054,9 +1331,9 @@ fn uv_sync_project(
         info!("Syncing dependencies with PyPI index: {index}");
         status_updater(dependency_start_update());
 
-        // uv.lock pins the download URLs and uv rewrites them only once the pinned ones break, so
-        // resolve the lock onto this index up front. That makes the index chosen here the index
-        // actually downloaded from, and an index that cannot resolve is unusable — skip it.
+        // uv.lock 锁定了下载 URL，且 uv 只有在锁定的 URL 失效时才会重写，
+        // 所以必须先把锁解析到当前镜像源上——这决定了实际从哪个源下载；
+        // 无法完成解析的源等于不可用，直接跳过。
         if !relock_onto_index(&bootstrap_uv, index, cancel_requested, &mut last_error) {
             if !disable_index(index, &next_indexes, attempt, &mut status_updater) {
                 break;
@@ -1074,9 +1351,8 @@ fn uv_sync_project(
             return Ok(());
         }
 
-        // A mirror that answers probes can still fail the download itself: 403, rate limiting, a
-        // broken CDN, or a package published in a format uv cannot read. Retry on a freshly
-        // resolved lock before writing the index off.
+        // 探测可达的镜像仍可能在下载环节失败（403、限流、CDN 损坏、
+        // 包格式不被 uv 识别等），先重锁一次再试，然后才判定该源不可用。
         info!("Retrying dependency sync with relocked URLs for {index}");
         if relock_onto_index(&bootstrap_uv, index, cancel_requested, &mut last_error)
             && sync_succeeds(
@@ -1098,7 +1374,10 @@ fn uv_sync_project(
     Err(last_error.unwrap_or_else(|| anyhow!(t!("setup.deps_failed").to_string())))
 }
 
-/// Resolve `uv.lock` so its download URLs come from `index`, recording a failure.
+/// 重锁 `uv.lock`，使其下载 URL 全部指向指定镜像源；失败记录到 last_error。
+///
+/// 返回 true 表示重锁成功、该源可用；false 表示源无法解析依赖，
+/// 应跳过换源。
 fn relock_onto_index(
     bootstrap_uv: &Path,
     index: &str,
@@ -1118,7 +1397,7 @@ fn relock_onto_index(
     }
 }
 
-/// Run one dependency sync attempt, recording the failure when it does not succeed.
+/// 执行一次依赖同步尝试；失败时记录错误并返回 false，由调用方决定回退。
 fn sync_succeeds(
     bootstrap_uv: &Path,
     index: &str,
@@ -1142,7 +1421,7 @@ fn sync_succeeds(
     }
 }
 
-/// Move on to the next candidate index, reporting whether one is left to try.
+/// 切换到下一个候选镜像源；返回 false 表示已无源可试，应终止流程。
 fn disable_index(
     index: &str,
     next_indexes: &[String],
@@ -1158,10 +1437,13 @@ fn disable_index(
     true
 }
 
-/// Rewrite the download URLs in `uv.lock` so they resolve against `index` alone.
+/// 重写 `uv.lock` 中的下载 URL，使其单独解析到指定镜像源。
 ///
-/// The index travels through a temporary config file, which is the only way to outrank the
-/// project's own `[tool.uv]` index list; `--default-index` does not.
+/// 镜像源经临时配置文件传入——只有这种方式能盖过项目自带的
+/// `[tool.uv]` 索引列表，`--default-index` 做不到。
+///
+/// # Errors
+/// 用户取消或 `uv lock` 执行失败时返回 Err。
 fn uv_relock_project(
     bootstrap_uv: &Path,
     index: &str,
@@ -1177,13 +1459,19 @@ fn uv_relock_project(
     )
 }
 
-/// Temporary `uv.toml` declaring the target index only; its directory is removed on drop.
+/// 临时 `uv.toml`，仅声明目标镜像源；Drop 时自动清理其所在目录。
 struct UvIndexOverride {
+    /// 临时目录（含进程 ID，避免多实例冲突），Drop 时整体删除。
     dir: PathBuf,
+    /// `uv.toml` 文件路径，传给 `--config-file`。
     path: PathBuf,
 }
 
 impl UvIndexOverride {
+    /// 创建临时配置目录并写入 `index-url = "<index>"`。
+    ///
+    /// # Errors
+    /// 目录创建或文件写入失败时返回 Err（已写入部分会被清理）。
     fn create(index: &str) -> Result<Self> {
         let dir = std::env::temp_dir().join(format!("azurpilot-relock-{}", std::process::id()));
         fs::create_dir_all(&dir)?;
@@ -1195,12 +1483,14 @@ impl UvIndexOverride {
         Ok(Self { dir, path })
     }
 
+    /// 返回临时 `uv.toml` 的路径。
     fn path(&self) -> &Path {
         &self.path
     }
 }
 
 impl Drop for UvIndexOverride {
+    /// Drop 时删除整个临时目录；清理失败只记警告，不影响主流程。
     fn drop(&mut self) {
         if let Err(err) = fs::remove_dir_all(&self.dir) {
             warn!(
@@ -1211,6 +1501,7 @@ impl Drop for UvIndexOverride {
     }
 }
 
+/// 构造 `uv sync` 命令：按当前平台的 `.venv` 路径同步依赖。
 fn uv_sync_command(bootstrap_uv: &Path, index: &str) -> Command {
     uv_sync_command_with_paths(
         bootstrap_uv,
@@ -1220,6 +1511,11 @@ fn uv_sync_command(bootstrap_uv: &Path, index: &str) -> Command {
     )
 }
 
+/// 组装 `uv sync --no-dev --no-install-project` 命令行与环境变量。
+///
+/// 显式指定 Python 与安装目录，保证不依赖系统 Python；
+/// `--default-index` 指定当前镜像源，并屏蔽外部 UV_INDEX 环境变量
+/// 的干扰（见 [`ignore_uv_index_env`]）。
 fn uv_sync_command_with_paths(
     bootstrap_uv: &Path,
     python: &Path,
@@ -1237,6 +1533,7 @@ fn uv_sync_command_with_paths(
     cmd
 }
 
+/// 构造 `uv lock` 命令，额外挂载临时配置文件以覆盖项目索引设置。
 fn uv_lock_command(bootstrap_uv: &Path, config_file: &Path, index: &str) -> Command {
     let mut cmd = uv_lock_command_with_paths(
         bootstrap_uv,
@@ -1248,6 +1545,7 @@ fn uv_lock_command(bootstrap_uv: &Path, config_file: &Path, index: &str) -> Comm
     cmd
 }
 
+/// 组装 `uv lock` 命令行与环境变量（指定 Python、安装目录与镜像源）。
 fn uv_lock_command_with_paths(
     bootstrap_uv: &Path,
     python: &Path,
@@ -1265,6 +1563,15 @@ fn uv_lock_command_with_paths(
     cmd
 }
 
+/// 迁移 `config/deploy.yaml` 到"自包含 .venv"的配置形态。
+///
+/// 逐行重写：可执行文件路径（Python/Adb/Git）强制指向 `.venv` 内的
+/// 平台路径；移除已废弃的 `RequirementsFile`（依赖改由 uv.lock 管理）；
+/// 强制 `InstallDependencies: true`；缺失的键按内置平台模板补齐。
+/// 文件为空（首次启动）时直接写入内置 deploy.yaml 基线。
+///
+/// # Errors
+/// 目录创建或文件写入失败时返回 Err。
 fn migrate_dependency_config() -> Result<()> {
     let path = "./config/deploy.yaml";
     if let Some(parent) = Path::new(path).parent() {
@@ -1273,6 +1580,7 @@ fn migrate_dependency_config() -> Result<()> {
 
     let mut changed = false;
     let content = fs::read_to_string(path).unwrap_or_default();
+    // 首次启动或配置为空时，以内置的平台模板作为迁移起点
     let content = if content.trim().is_empty() {
         changed = true;
         default_deploy_config().to_owned()
@@ -1357,6 +1665,12 @@ fn migrate_dependency_config() -> Result<()> {
     Ok(())
 }
 
+/// 调用上游 `deploy.atomic.atomic_failure_cleanup` 清理上次失败的残留。
+///
+/// 与 git 更新同理复用上游 Python 逻辑，保证清理规则与官方安装器一致。
+///
+/// # Errors
+/// 子命令执行失败时返回 Err（清理失败会阻断后续流程）。
 fn atomic_failure_cleanup(path: &str, cancel_requested: &AtomicBool) -> Result<()> {
     let mut cmd = Command::new(venv_python());
     cmd.args([
@@ -1369,6 +1683,7 @@ fn atomic_failure_cleanup(path: &str, cancel_requested: &AtomicBool) -> Result<(
     Ok(())
 }
 
+/// 构造运行时工具安装阶段（Python/工具链下载部署）的进度更新。
 fn runtime_tools_update(
     title: impl Into<String>,
     detail: impl Into<String>,
@@ -1378,6 +1693,8 @@ fn runtime_tools_update(
         .with_subtitle(t!("setup.rebuilding_env", tip = get_tip()).to_string())
 }
 
+/// 构造运行时工具阶段的等待进度：按耗时在 start/end 区间内线性推进，
+/// 并在 8 秒后切换为显示已等待秒数的文案。
 fn runtime_wait_update(
     title: &str,
     action: &str,
@@ -1400,6 +1717,14 @@ fn runtime_wait_update(
     runtime_tools_update(title, detail, progress)
 }
 
+/// 确保运行时工具链齐备：Python 环境 → uv 引导依赖 → 复制 uv/adb/git 进 `.venv`。
+///
+/// 是环境搭建的第一阶段：先保证 `.venv` 内有可用的 Python 与 requests，
+/// 再把 uv、adb、git 一并部署进 `.venv`，后续所有流程都只依赖 `.venv`
+/// 内的工具（用户机器无需预装任何东西）。
+///
+/// # Errors
+/// 用户取消、Python 安装失败或工具部署失败时返回 Err。
 fn ensure_runtime_tools(
     bootstrap_uv: &Path,
     cancel_requested: &AtomicBool,
@@ -1424,6 +1749,9 @@ fn ensure_runtime_tools(
     Ok(())
 }
 
+/// 读取 deploy.yaml 中用户配置的 PyPI 镜像（Deploy.Python.PypiMirror）。
+///
+/// 空值与字面量 "null" 均视为未配置，返回 `None`。
 fn deploy_pypi_mirror() -> Option<String> {
     get_deploy_config()
         .as_ref()
@@ -1435,6 +1763,8 @@ fn deploy_pypi_mirror() -> Option<String> {
         .map(|m| m.to_owned())
 }
 
+/// 规范化 PyPI 索引 URL：去空白、忽略 "null"、统一补齐尾部斜杠，
+/// 便于后续做等价比较；无效输入返回 `None`。
 fn normalize_pypi_index(url: &str) -> Option<String> {
     let trimmed = url.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
@@ -1447,11 +1777,13 @@ fn normalize_pypi_index(url: &str) -> Option<String> {
     }
 }
 
+/// 判断两个索引 URL 是否等价（忽略尾部斜杠与大小写差异）。
 fn pypi_indexes_match(left: &str, right: &str) -> bool {
     left.trim_end_matches('/')
         .eq_ignore_ascii_case(right.trim_end_matches('/'))
 }
 
+/// 向候选列表追加索引 URL，等价项去重（保持首次出现的顺序）。
 fn push_unique_pypi_index(indexes: &mut Vec<String>, url: &str) {
     let Some(index) = normalize_pypi_index(url) else {
         return;
@@ -1464,10 +1796,10 @@ fn push_unique_pypi_index(indexes: &mut Vec<String>, url: &str) {
     }
 }
 
-/// Candidate indexes in preference order.
+/// 按偏好顺序返回候选 PyPI 索引。
 ///
-/// A mirror configured in `deploy.yaml` leads, so the user's choice is what uv resolves against
-/// first; the built-in mirrors follow as the fallback chain.
+/// deploy.yaml 中用户配置的镜像最优先——用户的选择决定 uv 首先对
+/// 哪个源解析；内置国内镜像作为回退链，最后是官方 PyPI。
 fn pypi_index_candidates() -> Vec<String> {
     let mut indexes = Vec::new();
     if let Some(index) = deploy_pypi_mirror() {
@@ -1480,6 +1812,7 @@ fn pypi_index_candidates() -> Vec<String> {
     indexes
 }
 
+/// 构造"切换到下一个 PyPI 镜像重试"的启动画面进度。
 fn pypi_index_fallback_update(next_index: &str) -> SplashUpdate {
     SplashUpdate::loading(
         t!("setup.retrying_deps"),
@@ -1490,6 +1823,11 @@ fn pypi_index_fallback_update(next_index: &str) -> SplashUpdate {
     .with_uv_progress(2, t!("setup.uv_resolving", secs = "0"))
 }
 
+/// 对候选 PyPI 索引并发探测延迟，按"延迟最快优先"排序返回。
+///
+/// 每个候选源在独立线程中测延迟（HEAD 请求），全部探测完成后按
+/// 延迟升序排序；用户在 deploy.yaml 配置的镜像无论测速结果如何
+/// 都会被提到最前（尊重用户选择）。所有源都探测失败时退回配置顺序。
 fn ranked_pypi_indexes() -> Vec<String> {
     let indexes = pypi_index_candidates();
     let client = pypi_probe_http_client();
@@ -1570,6 +1908,9 @@ fn ranked_pypi_indexes() -> Vec<String> {
     ranked
 }
 
+/// 构造索引探测专用的 HTTP 客户端：短超时（3 秒连接 / 5 秒总超时）、
+/// 禁用系统代理（探测的是直连可达性）、带 PyPI simple API 的 Accept 头。
+/// 构建失败时返回 `None`（调用方回退为不排序）。
 fn pypi_probe_http_client() -> Option<Client> {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1591,12 +1932,17 @@ fn pypi_probe_http_client() -> Option<Client> {
         .ok()
 }
 
+/// 测量索引的响应延迟（HEAD 请求往返时间）；不可达或非 2xx 返回 `None`。
 fn measure_pypi_index_latency(client: &Client, index: &str) -> Option<Duration> {
     let start = Instant::now();
     let response = client.head(index).send().ok()?;
     response.status().is_success().then(|| start.elapsed())
 }
 
+/// 移除子进程环境中所有可能干扰镜像源选择的变量。
+///
+/// 用户机器上的 `UV_INDEX` / `PIP_INDEX_URL` 等会覆盖命令行
+/// `--default-index`，导致镜像回退链失效，故显式移除。
 fn ignore_uv_index_env(cmd: &mut Command) {
     for key in [
         "UV_INDEX",
@@ -1610,6 +1956,10 @@ fn ignore_uv_index_env(cmd: &mut Command) {
     }
 }
 
+/// 让子进程绕过系统代理直连（下载/更新全部走镜像，避免代理故障干扰）。
+///
+/// 仅移除代理变量还不够——uv 在变量缺失时会回退到平台级代理设置，
+/// 所以还要把 `NO_PROXY` 设为 `*` 明确声明"全部直连"。
 fn bypass_proxy_for_child(cmd: &mut Command) {
     for key in [
         "ALL_PROXY",
@@ -1627,6 +1977,11 @@ fn bypass_proxy_for_child(cmd: &mut Command) {
     cmd.env("NO_PROXY", "*").env("no_proxy", "*");
 }
 
+/// 隔离子进程的 Python 相关环境变量。
+///
+/// 用户机器上残留的 `PYTHONHOME` / `PYTHONPATH` / `VIRTUAL_ENV`
+/// 会让 `.venv` 内的解释器加载错误的库路径，是"本机能跑、
+/// 启动器里跑不起来"的常见根因，因此所有 Python 子进程统一清洗。
 pub(crate) fn isolate_python_child_environment(cmd: &mut Command) {
     for key in [
         "PYTHONHOME",
@@ -1641,6 +1996,13 @@ pub(crate) fn isolate_python_child_environment(cmd: &mut Command) {
     }
 }
 
+/// 确保 `.venv` 内已安装 `requests`（上游更新脚本的最小依赖）。
+///
+/// 先用 `import requests` 探测：已可用直接返回；缺失时按镜像源
+/// 优先级逐源尝试 `uv pip install requests`，等待期间刷新进度。
+///
+/// # Errors
+/// 用户取消或所有镜像源安装均失败时返回 Err。
 fn ensure_deploy_python_dependencies(
     bootstrap_uv: &Path,
     cancel_requested: &AtomicBool,
@@ -1705,10 +2067,16 @@ fn ensure_deploy_python_dependencies(
     bail!(t!("errors.requests_install_failed"));
 }
 
+/// 为 uv 子命令设置默认的 Python 安装目录环境（使用 `.venv` 内路径）。
 fn uv_python_env(cmd: &mut Command) {
     uv_python_env_with_install_dir(cmd, &venv_python_install_dir());
 }
 
+/// 统一配置 uv 子命令的环境变量：关闭交互进度、清除 UV_PYTHON 干扰、
+/// 指定 Python 安装目录与下载镜像、隔离 Python 环境、绕过代理。
+///
+/// 镜像仅在用户未通过 `UV_PYTHON_INSTALL_MIRROR` 显式指定时才注入
+/// 默认值（第一个为国内 npmmirror 加速源）。
 fn uv_python_env_with_install_dir(cmd: &mut Command, python_install_dir: &Path) {
     cmd.env("UV_NO_PROGRESS", "1")
         .env_remove("UV_PYTHON")
@@ -1723,6 +2091,7 @@ fn uv_python_env_with_install_dir(cmd: &mut Command, python_install_dir: &Path) 
     }
 }
 
+/// 取 Python standalone 下载镜像列表：用户显式指定的镜像优先（唯一），否则用内置列表。
 fn uv_python_install_mirrors() -> Vec<String> {
     if let Some(mirror) = std::env::var_os("UV_PYTHON_INSTALL_MIRROR") {
         return vec![mirror.to_string_lossy().into_owned()];
@@ -1734,6 +2103,15 @@ fn uv_python_install_mirrors() -> Vec<String> {
         .collect()
 }
 
+/// 确保 `.venv` 内有指定版本的自包含 Python（3.14.6）。
+///
+/// 版本检查逻辑：`.venv` 的 Python 低于最低可复用版本时删除整个
+/// 环境重建；版本满足则直接复用；不存在则全新创建。创建过程经
+/// uv 完成（managed python），并把 uv 镜像、隔离环境、代理直连
+/// 等约束注入子进程。
+///
+/// # Errors
+/// 用户取消、环境删除失败或 uv 安装 Python 失败时返回 Err。
 fn ensure_self_contained_python(
     bootstrap_uv: &Path,
     cancel_requested: &AtomicBool,
@@ -1863,6 +2241,13 @@ fn ensure_self_contained_python(
     Ok(())
 }
 
+/// 清空虚拟环境的标准布局目录（Scripts/Lib 等），为 `uv venv --allow-existing` 铺路。
+///
+/// uv 的 venv 命令不会覆盖已有布局文件，重建环境前必须先清掉旧布局；
+/// 只删标准条目而非整个 `.venv`，尽量保留无关数据。
+///
+/// # Errors
+/// 任一标准目录删除失败时返回 Err。
 fn reset_virtualenv_layout() -> Result<()> {
     let venv = venv_dir();
     let entries = if cfg!(windows) {
@@ -1886,6 +2271,10 @@ fn reset_virtualenv_layout() -> Result<()> {
     Ok(())
 }
 
+/// 在安装目录中查找 uv managed Python 的解释器路径。
+///
+/// uv 的安装目录名形如 `cpython-3.14.6-<平台标签>`，按前缀匹配
+/// 后尝试各平台约定的解释器位置；未安装时返回 `None`。
 fn managed_python_executable() -> Option<PathBuf> {
     let install_dir = venv_python_install_dir();
     let entries = fs::read_dir(install_dir).ok()?;
@@ -1914,6 +2303,10 @@ fn managed_python_executable() -> Option<PathBuf> {
     None
 }
 
+/// 读取 `.venv` 内 Python 的实际版本号（major.minor.patch）。
+///
+/// 解释器不存在、执行失败或输出无法解析时返回 `None`
+/// （均视为"环境不可用"，由调用方走重建路径）。
 fn venv_python_version() -> Option<(u16, u16, u16)> {
     let python = venv_python();
     if !python.exists() {
@@ -1932,6 +2325,8 @@ fn venv_python_version() -> Option<(u16, u16, u16)> {
     parse_python_version(std::str::from_utf8(&output.stdout).ok()?)
 }
 
+/// 解析 `sys.version_info` 输出的 `major.minor.patch` 三段版本号；
+/// 多于三段（含附加后缀）视为异常返回 `None`。
 fn parse_python_version(version: &str) -> Option<(u16, u16, u16)> {
     let mut components = version.trim().split('.');
     let major = components.next()?.parse().ok()?;
@@ -1943,14 +2338,24 @@ fn parse_python_version(version: &str) -> Option<(u16, u16, u16)> {
     Some((major, minor, patch))
 }
 
+/// 判断该 Python 版本是否低于最低可复用版本（需要删除重建整个 `.venv`）。
 fn venv_python_version_requires_rebuild(version: (u16, u16, u16)) -> bool {
     version < MIN_REUSABLE_VENV_PYTHON_VERSION
 }
 
+/// 判断该版本是否可直接复用：必须是 Python 3.14 系且不低于最低可复用版本
+/// （大版本不一致说明环境来自旧发行版，不能沿用）。
 fn is_reusable_venv_python_version(version: (u16, u16, u16)) -> bool {
     version.0 == 3 && version.1 == 14 && !venv_python_version_requires_rebuild(version)
 }
 
+/// 复制单个文件（源不存在时静默成功；内容相同则跳过写入）。
+///
+/// 跳过相同文件的检查可避免重复启动时无谓的写入；Unix 上复制后
+/// 补 0755 权限，保证工具可执行。
+///
+/// # Errors
+/// 目录创建或复制失败时返回 Err（含 i18n 错误信息）。
 fn copy_file_if_exists(from: &Path, to: &Path) -> Result<()> {
     if !from.exists() {
         return Ok(());
@@ -1983,6 +2388,10 @@ fn copy_file_if_exists(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 比较两个文件内容是否完全一致（先比大小再逐字节比较，尽早短路）。
+///
+/// # Errors
+/// 任一文件元数据或内容读取失败时返回 Err。
 fn files_match(left: &Path, right: &Path) -> Result<bool> {
     let left_metadata = fs::metadata(left).with_context(|| {
         t!(
@@ -2015,6 +2424,13 @@ fn files_match(left: &Path, right: &Path) -> Result<bool> {
     Ok(left_bytes == right_bytes)
 }
 
+/// 确保 adb 已部署进 `.venv`（已存在则跳过）。
+///
+/// Windows 发行包中 adb 与其依赖 DLL 分开放置，需一并复制；
+/// Unix 为单文件。
+///
+/// # Errors
+/// 工具复制失败时返回 Err。
 fn ensure_adb_in_venv() -> Result<()> {
     if venv_adb().exists() {
         return Ok(());
@@ -2028,6 +2444,14 @@ fn ensure_adb_in_venv() -> Result<()> {
     Ok(())
 }
 
+/// 确保 git 已部署进 `.venv`（已存在则跳过）。
+///
+/// Windows 为 MinGit 完整目录布局（`Scripts/git/`）；Unix 为单文件
+/// `bin/git` 加 `libexec/git-core`（HTTPS 远程支持）与模板目录，
+/// 复制完统一刷新 git 环境变量。
+///
+/// # Errors
+/// 工具复制失败时返回 Err。
 fn ensure_git_in_venv() -> Result<()> {
     if cfg!(windows) {
         if !venv_git().exists() {
@@ -2060,6 +2484,13 @@ fn ensure_git_in_venv() -> Result<()> {
     Ok(())
 }
 
+/// 从发行包的 `bootstrap/` 目录复制第一个存在的同名工具到目标目录。
+///
+/// 同一工具可能以多个候选名出现（如 `adb` / `adb.exe`），
+/// 取先命中者复制即止。
+///
+/// # Errors
+/// 复制失败时返回 Err。
 fn copy_first_packaged_tool(names: &[&str], target_dir: &Path) -> Result<()> {
     for name in names {
         let source = PathBuf::from("bootstrap").join(name);
@@ -2071,6 +2502,12 @@ fn copy_first_packaged_tool(names: &[&str], target_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 复制 `bootstrap/` 目录下所有"前缀+扩展名"匹配的文件（如 adb 的 DLL 依赖）。
+///
+/// 目录不存在时静默成功——发行包可能不包含该平台的附加文件。
+///
+/// # Errors
+/// 复制失败时返回 Err。
 fn copy_matching_packaged_tools(prefix: &str, extension: &str, target_dir: &Path) -> Result<()> {
     let dir = PathBuf::from("bootstrap");
     let Ok(entries) = fs::read_dir(dir) else {
@@ -2087,6 +2524,10 @@ fn copy_matching_packaged_tools(prefix: &str, extension: &str, target_dir: &Path
     Ok(())
 }
 
+/// 递归复制整个目录树（子目录递归，文件走 [`copy_file_if_exists`] 的去重逻辑）。
+///
+/// # Errors
+/// 目录创建或任一文件复制失败时返回 Err。
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
@@ -2102,6 +2543,9 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 把子进程的一行输出转换为启动画面进度更新（无法识别时返回 `None`）。
+///
+/// 按 [`ScriptPhase`] 分派给 git 或依赖各自的输出解析器。
 fn splash_update_for_output(
     line: &str,
     phase: ScriptPhase,
@@ -2119,6 +2563,11 @@ fn splash_update_for_output(
     }
 }
 
+/// 解析 git 更新输出行并映射为进度。
+///
+/// 上游脚本以 `===== 标题 =====` 分隔各阶段（SHOW DEPLOY CONFIG、
+/// GIT INIT 等），按标题映射到预设进度点；其余行尝试解析
+/// `git fetch --progress` 的百分比。
 fn splash_update_for_git_output(line: &str, state: &mut GitProgressState) -> Option<SplashUpdate> {
     let subtitle = t!("setup.syncing", tip = get_tip()).to_string();
 
@@ -2141,6 +2590,7 @@ fn splash_update_for_git_output(line: &str, state: &mut GitProgressState) -> Opt
     None
 }
 
+/// 组装 git 阶段的进度更新，进度经状态机钳制为单调递增。
 fn git_update_splash(
     raw_line: &str,
     detail: &str,
@@ -2158,6 +2608,9 @@ fn git_update_splash(
         .with_subtitle(subtitle)
 }
 
+/// 按上游脚本的阶段标题映射预设进度点（18% 起，随阶段推进）。
+///
+/// 标题与 `deploy/installer.py` 的输出保持一致，上游改动时需同步。
 fn git_section_progress(section: &str) -> Option<u8> {
     if section.contains("SHOW DEPLOY CONFIG") {
         Some(18)
@@ -2180,6 +2633,10 @@ fn git_section_progress(section: &str) -> Option<u8> {
     }
 }
 
+/// 解析 `git fetch` 进度行的百分比，并按子阶段映射到总进度区间。
+///
+/// Counting/Compressing（25-29）→ Receiving（29-52）→ Resolving
+/// deltas（52-58）→ Updating files（58-62），与阶段标题的进度点衔接。
 fn git_line_progress(line: &str) -> Option<u8> {
     let percentage = find_percentage(line)?;
     if line.contains("Counting objects:") || line.contains("Compressing objects:") {
@@ -2195,6 +2652,10 @@ fn git_line_progress(line: &str) -> Option<u8> {
     }
 }
 
+/// 解析 uv sync 的状态行并映射为依赖同步进度。
+///
+/// 仅识别 uv 的已知状态前缀（Resolved/Downloading/...），其余输出
+/// 忽略；识别到的行先喂给状态机再取总进度。
 fn splash_update_for_dependency_output(
     line: &str,
     uv_progress: &mut UvProgressState,
@@ -2215,6 +2676,7 @@ fn splash_update_for_dependency_output(
     Some(dependency_splash_update(line, progress, uv_progress))
 }
 
+/// 组装依赖同步阶段的进度更新（总进度 + uv 子进度两段显示）。
 fn dependency_splash_update(
     detail: impl Into<String>,
     progress: u8,
@@ -2225,10 +2687,15 @@ fn dependency_splash_update(
         .with_uv_progress(uv_progress.progress(), uv_progress.detail())
 }
 
+/// 把 uv 子进度（0-100）线性映射到总进度条的 64-90 区间。
 fn dependency_global_progress(uv_progress: u8) -> u8 {
     scale_progress(uv_progress, 64, 90)
 }
 
+/// 判断一行 stderr 是否为 uv 的正常进度/提示输出。
+///
+/// uv 把进度写在 stderr 上，这类行不应按错误处理（不记入
+/// "最后错误"、日志级别降为 info）。
 fn is_uv_progress_line(line: &str) -> bool {
     line.starts_with("Resolved ")
         || line.starts_with("Downloading ")
@@ -2242,6 +2709,7 @@ fn is_uv_progress_line(line: &str) -> bool {
 }
 
 impl UvProgressState {
+    /// 消费一行 uv 状态输出，更新解析/下载/安装各阶段标记与下载统计。
     fn observe(&mut self, line: &str) {
         if line.starts_with("Resolved ") {
             self.resolved = true;
@@ -2277,12 +2745,19 @@ impl UvProgressState {
         }
     }
 
+    /// 估算 uv 阶段的整体进度（0-100，单调递增）。
+    ///
+    /// 各阶段锚点：启动后按时间缓慢爬升（0-20）、解析完成 22、
+    /// 下载期取"时间估算"与"包数估算"的较大者（28-88）、准备完成
+    /// 92、安装完成 98。进度只会前进，避免输出乱序导致回退。
     fn progress(&mut self) -> u8 {
         let progress = if self.installed {
             98
         } else if self.prepared {
             92
         } else if let Some(download_started_at) = self.download_started_at {
+            // 双估算取大者：时间估算保证进度不因包信息缺失而停滞，
+            // 包数估算让大包下载时进度更贴近真实
             let elapsed_progress = 28 + (download_started_at.elapsed().as_secs() / 4).min(60) as u8;
             let package_progress =
                 28 + (self.downloaded_packages.len().min(30) as u8).saturating_mul(2);
@@ -2297,6 +2772,8 @@ impl UvProgressState {
         self.last_progress
     }
 
+    /// 生成 uv 子进度的描述文案：安装中 / 解析中（含耗时）/
+    /// 下载中（含已下载量与实时速度估算）。
     fn detail(&self) -> String {
         if self.installed || self.prepared {
             return t!("setup.uv_installing").to_string();
@@ -2324,6 +2801,10 @@ impl UvProgressState {
     }
 }
 
+/// 从 `Downloading <包名> (体积)` 行提取包名。
+///
+/// 兼容 `numpy==2.4.3`、`numpy @ https://...` 与裸包名三种格式；
+/// 包名统一小写以便与 Downloaded 行配对。
 fn extract_uv_package_name(line: &str) -> Option<String> {
     // "Downloading numpy==2.4.3 (8.2 MiB)" or "Downloading numpy (8.2 MiB)" or "Downloading numpy @ https://..."
     let rest = line.strip_prefix("Downloading ")?;
@@ -2336,6 +2817,7 @@ fn extract_uv_package_name(line: &str) -> Option<String> {
     normalize_uv_package_name(name)
 }
 
+/// 从 `Downloaded <包名>` 行提取包名（取首个空白分隔段并去掉版本号）。
 fn extract_uv_downloaded_package_name(line: &str) -> Option<String> {
     let name = line
         .strip_prefix("Downloaded ")?
@@ -2345,6 +2827,7 @@ fn extract_uv_downloaded_package_name(line: &str) -> Option<String> {
     normalize_uv_package_name(name)
 }
 
+/// 包名归一化：去空白并转小写；空名返回 `None`。
 fn normalize_uv_package_name(name: &str) -> Option<String> {
     let name = name.trim().to_ascii_lowercase();
     if name.is_empty() {
@@ -2354,12 +2837,17 @@ fn normalize_uv_package_name(name: &str) -> Option<String> {
     }
 }
 
+/// 从 `Downloading ... (8.2 MiB)` 行提取括号内的人类可读体积并转为字节数。
 fn extract_uv_download_size_bytes(line: &str) -> Option<u64> {
     let (_, size) = line.rsplit_once('(')?;
     let size = size.strip_suffix(')')?;
     parse_transfer_size_bytes(size)
 }
 
+/// 解析人类可读体积（`1.5MiB`、`42 KiB` 等）为字节数。
+///
+/// 支持二进制单位（KiB/MiB/GiB）与十进制写法（KB/MB/GB）；
+/// 非法输入、非有限数或超出 u64 范围时返回 `None`。
 fn parse_transfer_size_bytes(size: &str) -> Option<u64> {
     let size = size.trim();
     let unit_start =
@@ -2377,6 +2865,7 @@ fn parse_transfer_size_bytes(size: &str) -> Option<u64> {
     (bytes.is_finite() && bytes >= 0.0 && bytes <= u64::MAX as f64).then_some(bytes.round() as u64)
 }
 
+/// 把字节数格式化为人类可读体积（自动选择 B/KiB/MiB/GiB 单位，一位小数）。
 fn format_transfer_size(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -2394,10 +2883,12 @@ fn format_transfer_size(bytes: u64) -> String {
     }
 }
 
+/// 把字节每秒的速率格式化为人类可读体积速率（负数按 0 处理）。
 fn format_transfer_speed(bytes_per_second: f64) -> String {
     format_transfer_size(bytes_per_second.max(0.0).round() as u64)
 }
 
+/// 把 0-100 的百分比线性缩放到 `[start, end]` 区间（进度条分段衔接用）。
 fn scale_progress(percentage: u8, start: u8, end: u8) -> u8 {
     let percentage = percentage.min(100) as u16;
     let start = start as u16;
@@ -2405,6 +2896,7 @@ fn scale_progress(percentage: u8, start: u8, end: u8) -> u8 {
     (start + ((percentage * (end - start)) / 100)) as u8
 }
 
+/// 从一行文本中提取最后一个 `N%` 形式的百分比数字；无百分比返回 `None`。
 fn find_percentage(s: &str) -> Option<u8> {
     s.split('%')
         .next()
@@ -2420,6 +2912,7 @@ fn find_percentage(s: &str) -> Option<u8> {
         })
 }
 
+/// 单元测试：覆盖删除恢复、进度解析、uv 命令环境约束与体积格式化。
 #[cfg(test)]
 mod tests {
     use super::*;

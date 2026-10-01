@@ -1,13 +1,28 @@
+//! 国际化模块：确定界面语言并设置全局 locale。
+//!
+//! 语言选择的优先级为：命令行 `--lang` / `--locale` 参数最高，
+//! 其次按系统 locale 自动检测，均未命中时回退到 `en`。
+//! 翻译文件位于 `locales/*.yml`（基准语言为 `zh-CN`），代码中
+//! 通过 `t!("module.key")` 宏取词；本模块在应用启动最早阶段调用
+//! [`init`] 完成设置，之后所有模块共享同一 locale。
+
 const LOCALE_OVERRIDE_ARGS: &[&str] = &["--lang", "--locale", "/lang", "/locale"];
 
-/// 初始化 i18n：检测系统语言（或启动参数覆盖），设置全局 locale
+/// 初始化 i18n：检测系统语言（或启动参数覆盖），设置全局 locale。
+///
+/// 优先解析启动参数中的语言覆盖值；未指定时回退到系统 locale
+/// 自动检测。结果写入 rust-i18n 的全局 locale，并记录日志便于排查。
 pub fn init() {
     let locale = locale_from_args().unwrap_or_else(detect_locale);
     rust_i18n::set_locale(&locale);
     tracing::info!("i18n locale set to: {}", locale);
 }
 
-/// 检查启动参数中是否有 --lang / --locale 覆盖
+/// 检查启动参数中是否有 --lang / --locale 覆盖。
+///
+/// 同时支持 `--lang <值>`（空格分隔）与 `--lang=<值>`（等号连接）
+/// 两种写法；Windows 下 `/lang` 前缀同样有效。返回标准化后的
+/// locale 字符串，未找到覆盖参数时返回 `None`。
 fn locale_from_args() -> Option<String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     for (i, arg) in args.iter().enumerate() {
@@ -28,7 +43,12 @@ fn locale_from_args() -> Option<String> {
     None
 }
 
-/// 将用户输入的语言代码标准化为支持的 locale
+/// 将用户输入的语言代码标准化为支持的 locale。
+///
+/// 支持的取值：`zh-CN`（含所有 `zh*` 前缀，除非明确指向繁体）、
+/// `zh-TW`（含 `tw` / `hk` / `hant` / `zht` 变体）、`ja`（含 `jp`）、
+/// `en`（含 `us`）。无法识别的输入告警后回退 `en`，保证界面
+/// 永远有可用的语言。
 fn normalize_locale(input: &str) -> String {
     let lower = input.to_ascii_lowercase();
     if lower.starts_with("zh") {
@@ -53,7 +73,11 @@ fn normalize_locale(input: &str) -> String {
     }
 }
 
-/// 检测系统语言，返回对应的 locale 字符串
+/// 检测系统语言，返回对应的 locale 字符串。
+///
+/// 通过 sys-locale crate 读取系统 locale（如 `zh_CN.UTF-8`、
+/// `ja-JP`），映射规则与 [`normalize_locale`] 一致；读取失败时
+/// 视为 `en`。
 fn detect_locale() -> String {
     let sys_locale = sys_locale::get_locale().unwrap_or_else(|| "en".to_string());
 
