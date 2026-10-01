@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$LauncherExecutable,
     [Parameter(Mandatory)][string]$InnoCompiler,
     [Parameter(Mandatory)][string]$SetupRoot,
+    [Parameter(Mandatory)][string]$CrtRoot,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [string]$Repository = 'https://github.com/Beatrice-betty/AzurPilot.git',
     [string]$Branch = 'codex/lifecycle-diagnostics'
@@ -14,8 +15,11 @@ $sourceRoot = Split-Path $PSScriptRoot -Parent
 $versionMatch = [regex]::Match([IO.File]::ReadAllText("$sourceRoot\Cargo.toml"), '(?m)^version = "([^"]+)"')
 if (-not $versionMatch.Success) { throw '无法读取启动器版本' }
 $version = $versionMatch.Groups[1].Value
-foreach ($required in @("$AlasSource\deploy\installer.py", "$BootstrapRoot\adb.exe", "$BootstrapRoot\AdbWinApi.dll", "$BootstrapRoot\AdbWinUsbApi.dll", "$BootstrapRoot\git\cmd\git.exe", $LauncherExecutable, $InnoCompiler)) {
+foreach ($required in @("$AlasSource\deploy\installer.py", "$BootstrapRoot\adb.exe", "$BootstrapRoot\AdbWinApi.dll", "$BootstrapRoot\AdbWinUsbApi.dll", "$BootstrapRoot\git\cmd\git.exe", "$CrtRoot\vcruntime140.dll", "$CrtRoot\vcruntime140_1.dll", "$SetupRoot\vcredist_x64.exe", $LauncherExecutable, $InnoCompiler)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "缺少打包输入：$required" }
+}
+if ((Get-Item -LiteralPath "$SetupRoot\vcredist_x64.exe").VersionInfo.FileMajorPart -lt 14) {
+    throw '安装器需要 VC++ v14，不能使用旧的 VC++ 2013 运行库'
 }
 if (Test-Path -LiteralPath $OutputDirectory) { throw '输出目录已存在，请选择新的目录以保留旧产物' }
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
@@ -27,6 +31,9 @@ git -C $AlasSource archive --format=zip "--output=$OutputDirectory\deploy-source
 if ($LASTEXITCODE -ne 0) { throw '导出本体部署工具失败' }
 Expand-Archive -LiteralPath "$OutputDirectory\deploy-source.zip" -DestinationPath $packageRoot
 Copy-Item -LiteralPath $LauncherExecutable -Destination "$packageRoot\alas-launcher.exe"
+foreach ($name in @('vcruntime140.dll', 'vcruntime140_1.dll')) {
+    Copy-Item -LiteralPath (Join-Path $CrtRoot $name) -Destination (Join-Path $packageRoot $name)
+}
 foreach ($name in @('adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll')) {
     Copy-Item -LiteralPath (Join-Path $BootstrapRoot $name) -Destination "$packageRoot\bootstrap\$name"
 }
@@ -38,6 +45,9 @@ $config = $config.Replace('Repository: git://git.pull/AzurPilot', "Repository: $
 # 诊断版使用独立安装身份和目录；不能沿用上游按名称清理所有 Python/Git 的操作。
 $installer = [IO.File]::ReadAllText("$sourceRoot\install.iss")
 $installer = $installer.Replace('AppName=AzurPilot', 'AppName=AzurPilot Diagnostics')
+$installer = $installer.Replace('ArchitecturesAllowed=x86 x64', 'ArchitecturesAllowed=x64compatible')
+$installer = $installer.Replace('ArchitecturesInstallIn64BitMode=x64', 'ArchitecturesInstallIn64BitMode=x64compatible')
+$installer = $installer.Replace('; 应用本体', '; 应用本体' + "`r`n" + 'Source: "{#PackageRoot}\*.dll"; DestDir: "{app}"; Flags: ignoreversion; Permissions: users-modify')
 $installer = $installer.Replace('DefaultDirName={autopf}\AzurPilot', 'DefaultDirName={autopf}\AzurPilot-Diagnostics')
 $installer = $installer.Replace('DefaultGroupName=AzurPilot', 'DefaultGroupName=AzurPilot Diagnostics')
 $installer = $installer.Replace('AppId={{1A779131-3DD5-067C-0ABC-E656396F6879}', 'AppId={{B0C9B25D-65C3-459E-A039-C754D7E244C0}')
