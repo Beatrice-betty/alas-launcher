@@ -1,0 +1,71 @@
+{
+  "repo_notes": [
+    {
+      "content": "语言要求：所有 Wiki 页面必须使用简体中文和英文双语。每个章节先给出完整的简体中文说明，再给出语义等价的完整英文说明；不得仅翻译标题或只用一种语言概述。页面标题与章节标题使用“中文 / English”；步骤、表格、提示和图表说明也必须双语。代码、命令、标识符和路径保持原样，避免重复相同的代码块。Language requirement: Every wiki page must be bilingual in Simplified Chinese and English. In each section, provide the complete Chinese explanation first, followed by its complete English equivalent. Translate all prose, steps, tables, notes and diagram explanations, not just headings. Use Chinese / English titles and headings. Preserve code, commands, identifiers and paths verbatim and avoid duplicating identical code blocks."
+    },
+    {
+      "content": "项目范围：这是 AzurPilot 的 Tauri 2 + Rust 桌面启动器，支持 Windows、macOS、Linux。游戏自动化与 Python WebUI 实现在外部 AzurPilot 仓库，本仓库负责安装、更新和启动后端，不要把外部代码当作本仓库实现。Project scope: This repository is the Tauri 2 + Rust desktop launcher for AzurPilot on Windows, macOS and Linux. Game automation and the Python WebUI belong to the external AzurPilot repository; explain the integration boundary without inventing external implementations."
+    },
+    {
+      "content": "事实与证据：优先依据当前 src/、build.rs、Cargo.toml、tauri.conf.json、部署配置和 CI 源码，README、CLAUDE.md、AGENTS.md 与 CHANGELOG.md 提供背景。文档与实现冲突时采用当前代码并注明差异；从代码读取版本、端口、超时、重试与环境变量，不沿用过期数字。引用相关文件和符号，区分实际实现与建议。Evidence: Prioritize current source and configuration over prose documents. Resolve conflicts in favor of current code and explain discrepancies. Derive versions, ports, timeouts, retries and environment variables from source. Link relevant files and symbols and distinguish implemented behavior from recommendations."
+    },
+    {
+      "content": "架构重点：没有独立前端目录，启动页和错误页 HTML/CSS/JS 内嵌于 src/main.rs，并通过自定义 URI 协议加载；主窗口加载本机 Python 后端的 WebUI。说明 Rust、内嵌页面与外部后端的控制流、数据流和生命周期。Architecture focus: There is no standalone frontend directory. Splash and error HTML/CSS/JS are embedded in src/main.rs and served through custom URI schemes; the main window loads the local Python backend WebUI. Explain control flow, data flow and lifecycle across these boundaries."
+    },
+    {
+      "content": "保密与平台：只解释 mTLS、登录密钥等机制及配置名称，不读取或输出证书.txt、私钥、令牌或本地凭据内容。说明 cfg 平台分支及 CreateNoWindow 的用途，不要把 Windows 专属安装逻辑推广到其他平台。Confidentiality and platforms: Explain security mechanisms and configuration names without reading or reproducing certificate files, private keys, tokens or local credentials. Describe platform-specific cfg branches and CreateNoWindow, and clearly identify Windows-only installation behavior."
+    }
+  ],
+  "pages": [
+    {
+      "title": "项目概览 / Project Overview",
+      "purpose": "介绍启动器用途、支持平台、与 AzurPilot 及 AzurLaneAutoScript 的关系、用户安装和启动入口；依据 README.md、README_en.md、Cargo.toml。Explain the launcher purpose, supported platforms, relationship to AzurPilot and AzurLaneAutoScript, and user installation and launch entry points using the READMEs and Cargo.toml.",
+      "parent": null
+    },
+    {
+      "title": "架构与启动流程 / Architecture and Startup Flow",
+      "purpose": "依据 src/main.rs、src/setup.rs、src/backend.rs，按实际调用顺序解释初始化、启动画面、环境准备、自更新检查、后端启动及主窗口打开，用双语说明时序图、组件职责与失败路径。Explain initialization, splash, environment preparation, launcher update checks, backend startup and main-window opening in actual call order, with bilingual sequence diagrams, component responsibilities and failure paths.",
+      "parent": null
+    },
+    {
+      "title": "环境安装与依赖同步 / Environment Setup and Dependency Sync",
+      "purpose": "依据 src/setup.rs、src/nodejs.rs、build.rs 和六个 deploy.*.yaml，解释 uv、Python、可重定位 .venv、git、adb、Windows Node.js 检测与安装、uv sync、部署配置迁移、国内镜像、重试与修复流程。Document uv, Python, relocatable .venv, git, adb, Windows Node.js detection and installation, uv sync, deployment migration, China mirrors, retries and repair behavior.",
+      "parent": "架构与启动流程 / Architecture and Startup Flow"
+    },
+    {
+      "title": "后端进程与连接管理 / Backend Process and Connection Management",
+      "purpose": "依据 src/backend.rs 和 src/main.rs，解释 gui.py 子进程、环境变量隔离、端口检测、就绪超时、连接重试、.venv 修复、退出与重启、Drop 清理及 ALAS_LAUNCHER_PID 防泄漏；从代码确认具体时间与条件。Explain gui.py subprocess management, environment isolation, ports, readiness timeouts, retries, .venv repair, shutdown, restart, Drop cleanup and ALAS_LAUNCHER_PID leak prevention; verify timings and conditions in source.",
+      "parent": "架构与启动流程 / Architecture and Startup Flow"
+    },
+    {
+      "title": "启动页与原生窗口 / Splash and Native Windows",
+      "purpose": "依据 src/main.rs、src/window_util.rs、tauri.conf.json，解释 alas-splash 与 alas-error 协议、内嵌 HTML、SplashUpdate 回调、主进度与 UV 进度、loading.webp 头部、视频与字体嵌入、标题栏、拖动、退出确认、主题与平台差异。Explain URI schemes, embedded HTML, SplashUpdate callbacks, main and UV progress, the loading.webp marker, embedded video and fonts, title bars, dragging, exit confirmation, themes and platform differences.",
+      "parent": "架构与启动流程 / Architecture and Startup Flow"
+    },
+    {
+      "title": "后端控制与系统集成 / Backend Control and System Integration",
+      "purpose": "依据 src/notify.rs、src/launcher_control.rs、src/autostart.rs、src/main.rs，解释 SSE 通知与反向控制通道、重连、平台原生通知、托盘、开机自启、启动最小化和后端退出/重启指令。Explain SSE notifications and reverse control, reconnection, native notifications, tray, autostart, minimized startup and backend exit/restart commands.",
+      "parent": "架构与启动流程 / Architecture and Startup Flow"
+    },
+    {
+      "title": "自更新与安全边界 / Self-Update and Security Boundaries",
+      "purpose": "依据 src/main.rs、src/setup.rs、build.rs，区分启动器自更新和 AzurPilot git 更新，解释清单来源及回退、下载与校验、更新替换、mTLS 配置、WebUI 免密登录握手、代理策略、Windows 管理员权限与时间炸弹配置；不泄露凭据。Distinguish launcher self-update from AzurPilot git updates. Explain manifest sources and fallbacks, download verification, replacement, mTLS configuration, WebUI login handshake, proxy policy, Windows elevation and time-bomb configuration without exposing credentials.",
+      "parent": null
+    },
+    {
+      "title": "部署配置与国际化 / Deployment Configuration and Internationalization",
+      "purpose": "依据六个 deploy.*.yaml、src/i18n.rs、locales/、tauri.conf.json，解释配置选择、国内与国际镜像差异、配置迁移、命令行语言覆盖、系统 locale 检测、回退及四语言维护。Wiki 本身仍须中英双语，不因程序支持四语言而扩展语言范围。Explain configuration selection, mirror variants, migration, language CLI overrides, locale detection, fallback and four-locale maintenance. Keep the wiki itself bilingual Chinese/English.",
+      "parent": null
+    },
+    {
+      "title": "开发、测试与故障排查 / Development, Testing and Troubleshooting",
+      "purpose": "依据 Cargo.toml、build.rs、src/ 中测试、CLAUDE.md 和 README，说明 cargo build/check/test、预览参数、构建环境变量、Windows 测试提升权限问题、日志位置，以及环境安装失败、后端连接失败、更新失败的排查步骤；明确本地占位 uv 与正式内嵌构建的区别。Document development commands, preview flags, build variables, Windows test elevation, logs and evidence-based troubleshooting for setup, connection and update failures. Distinguish placeholder uv in local builds from bundled release builds.",
+      "parent": null
+    },
+    {
+      "title": "打包与版本发布 / Packaging and Release",
+      "purpose": "依据 .github/workflows/package.yml、install.iss、Cargo.toml、Cargo.lock、tauri.conf.json、CHANGELOG.md，解释 tag 与手动触发、实际平台矩阵、uv 与 Python 打包、产物格式、Windows 安装器及版本同步要求；区分 CI 当前执行步骤与仓库中未被 CI 调用的脚本。Explain tag/manual triggers, the actual platform matrix, uv/Python bundling, artifact formats, Windows installer and version synchronization. Distinguish active CI steps from scripts merely present in the repository.",
+      "parent": null
+    }
+  ]
+}
