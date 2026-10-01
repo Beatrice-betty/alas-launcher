@@ -75,6 +75,7 @@ const MENUBAR_ICON_1X: &[u8] = include_bytes!("../icons/menubar.png");
 #[cfg(windows)]
 const WINDOWS_TRAY_ICON: &[u8] = include_bytes!("../icons/icon.png");
 const SPLASH_BG_VIDEO: &[u8] = include_bytes!("../bg/bg.mp4");
+const SPLASH_PROGRESS_HEAD: &[u8] = include_bytes!("../bg/loading.webp");
 const MI_SANS_FONT: &[u8] = include_bytes!("../fonts/MiSansLauncher.ttf");
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const BACKEND_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -3736,6 +3737,7 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     align-items: center;
     gap: 12px;
     margin-bottom: 15px;
+    min-height: 40px;
   }
   .progress-bar-bg {
     grid-column: 1;
@@ -3744,7 +3746,8 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     height: 5px;
     border-radius: 999px;
     background: rgba(255, 255, 255, 0.2);
-    overflow: hidden;
+    position: relative;
+    overflow: visible;
     box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.12);
     backdrop-filter: blur(8px);
   }
@@ -3757,6 +3760,18 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     position: relative;
     overflow: hidden;
     transition: width 0.35s cubic-bezier(.23, 1, .32, 1), background-color 0.2s ease;
+  }
+  .progress-head {
+    position: absolute;
+    left: clamp(30px, var(--progress, 4%), calc(100% - 30px));
+    top: 50%;
+    width: 60px;
+    height: 40px;
+    object-fit: contain;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    user-select: none;
+    transition: left 0.35s cubic-bezier(.23, 1, .32, 1);
   }
   .progress-bar-fill::after {
     display: none;
@@ -4003,6 +4018,7 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
         <div id="progress-pct" class="progress-percentage">4%</div>
         <div class="progress-bar-bg">
           <div id="progress-fill" class="progress-bar-fill" style="width: 4%;"></div>
+          <img class="progress-head" src="data:image/webp;base64,$PROGRESS_HEAD" alt="" aria-hidden="true" draggable="false">
         </div>
       </div>
 
@@ -4085,6 +4101,7 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
 
       const progress = Math.max(0, Math.min(100, Number(payload.progress || 0)));
       progressFill.style.width = progress + '%';
+      progressFill.parentElement.style.setProperty('--progress', progress + '%');
       progressPct.textContent = progress + '%';
 
       const uvState = payload.uv_progress;
@@ -4174,6 +4191,7 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
   </script>
 </body>
 </html>"#
+    .replace("$PROGRESS_HEAD", &BASE64_STANDARD.encode(SPLASH_PROGRESS_HEAD))
     .replace("$VIDEO_BG", video_bg_b64)
     .replace("$MI_SANS_FONT", mi_sans_font_b64)
     .replace("$LAUNCHER_VERSION", env!("CARGO_PKG_VERSION"))
