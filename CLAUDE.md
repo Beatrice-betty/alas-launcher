@@ -171,6 +171,17 @@ Windows 和 Linux 移除原生窗口装饰（`set_decorations(false)`），通�
 
 ### CI/CD
 
+测试流水线（`.github/workflows/test.yml`）：
+
+- 触发条件：推送 `main`、所有 PR 或手动 `workflow_dispatch`
+- 测试矩阵：`ubuntu-22.04`、`macos-latest`、`windows-latest`、`windows-11-arm`
+- 安装 Linux Tauri 系统依赖及 stable Rust，按 runner/架构缓存 Cargo 依赖；仅 `main` 保存缓存
+- 执行 `cargo check --locked --all-targets` 和 `cargo test --locked --all-targets`，覆盖启动器和示例目标
+- 同一事件/分支的新运行取消旧运行；单个矩阵任务失败不取消其他平台，超时为 45 分钟
+- 使用 `build.rs` 的 uv/mTLS 空占位符，不需要发布密钥，也不执行打包或部署
+- Windows 托管 runner 以管理员身份运行，满足启动器 manifest 和 Node.js 安全目录 ACL 的要求；Windows 本地测试也需管理员终端
+- 可在 GitHub Actions 中选择 **Test AzurPilot → Run workflow** 手动运行；本地使用上述两条 Cargo 命令复现
+
 GitHub Actions（`.github/workflows/package.yml`）：
 - 触发条件：tag push 或手动 `workflow_dispatch`
 - 构建矩阵：`ubuntu-22.04`、`macos-latest`、`windows-latest`

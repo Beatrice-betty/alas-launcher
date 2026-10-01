@@ -1,0 +1,63 @@
+name: Test AzurPilot
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest, windows-11-arm]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Tauri dependencies (Ubuntu only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libwebkit2gtk-4.1-dev libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}-${{ runner.arch }}
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Tests use build.rs placeholders for uv and mTLS; no release secrets needed.
+      - name: Check all targets
+        run: cargo check --locked --all-targets
+
+      # GitHub-hosted Windows runners run as administrators, as required by
+      # the launcher manifest and protected Node.js installer directory tests.
+      - name: Run tests
+        run: cargo test --locked --all-targets
