@@ -2,6 +2,19 @@ name: Pack AzurPilot
 
 on:
   push:
+    # Default-branch caches can be restored by subsequent release tags.
+    branches: [main]
+    paths:
+      - '.github/workflows/package.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'src/**'
+      - 'bg/**'
+      - 'fonts/**'
+      - 'icons/**'
+      - 'tauri.conf.json'
+      - 'deploy.*.yaml'
     tags:
       - '*'
   workflow_dispatch:
@@ -14,7 +27,7 @@ on:
 env:
   UV_VERSION: "0.11.32"
   UV_MANAGED_PYTHON: 1
-  UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}/python
+  UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}/.ci-cache/python
   UV_PYTHON: 3.14.6
 
 jobs:
@@ -44,6 +57,11 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-suffix: ${{ matrix.os }}-${{ runner.arch }}-python-${{ env.UV_PYTHON }}
+          cache-dependency-glob: |
+            deploy.*.yaml
+            .github/workflows/package.yml
       - name: Prepare version from tag or input
         shell: python
         env:
@@ -143,13 +161,29 @@ jobs:
         run: rustup toolchain install stable --profile minimal
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          # Keep native dependency artifacts separate for each runner image/CPU.
+          shared-key: release-${{ matrix.os }}-${{ runner.arch }}
+          cache-bin: false
       - name: Build
         env:
           ALAS_LAUNCHER_MTLS_IDENTITY_PEM_B64: ${{ secrets.ALAS_LAUNCHER_MTLS_IDENTITY_PEM_B64 }}
           REQUIRE_LAUNCHER_MTLS_IDENTITY: "1"
           LAUNCHER_UPDATE_URL: https://ap-launcher-update.nanoda.work/updata/stable.json
-        run: cargo build --verbose --release
+        run: cargo build --locked --release
+      - name: Restore bundled Git cache
+        id: bundled-git-cache
+        uses: actions/cache@v4
+        with:
+          # Hash the build recipe, including Git/Conan/pedeps versions.
+          key: bundled-git-v1-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/package.yml') }}
+          path: |
+            git/dist
+            git/cmd
+            git/mingw64
+            pedeps
       - name: Get git
+        if: steps.bundled-git-cache.outputs.cache-hit != 'true'
         uses: knicknic/os-specific-run@v1.0.3
         with:
           linux: |
@@ -198,7 +232,25 @@ jobs:
             mkdir git
             cd git
             tar -xvf ..\MinGit-2.51.0.2-busybox-64-bit.zip
+      - name: Determine ADB cache epoch
+        id: adb-cache-epoch
+        shell: python
+        run: |
+          import datetime
+          import os
+          # platform-tools-latest is mutable; refresh at least once per UTC week.
+          year, week_number, _ = datetime.datetime.now(datetime.timezone.utc).isocalendar()
+          week = f"{year}-{week_number:02d}"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"week={week}\n")
+      - name: Restore ADB cache
+        id: adb-cache
+        uses: actions/cache@v4
+        with:
+          key: adb-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.adb-cache-epoch.outputs.week }}
+          path: platform-tools
       - name: Get adb
+        if: steps.adb-cache.outputs.cache-hit != 'true'
         uses: knicknic/os-specific-run@v1.0.3
         with:
           macos: |
@@ -210,11 +262,23 @@ jobs:
           windows: |
             curl -L -o adb.zip https://dl.google.com/android/repository/platform-tools-latest-windows.zip
             tar -xvf adb.zip
+      - name: Restore managed Python cache
+        uses: actions/cache@v4
+        with:
+          key: managed-python-v1-${{ matrix.os }}-${{ runner.arch }}-${{ env.UV_PYTHON }}-uv-${{ env.UV_VERSION }}
+          path: .ci-cache/python
+      - name: Prepare managed Python
+        # uv validates the installed runtime; cache hits do not download it again.
+        run: uv python install --no-bin --managed-python "${{ env.UV_PYTHON }}"
+      - name: Warm packaging dependency cache
+        run: uv run --no-project --with requests python -c "import requests"
       - name: Get AzurPilot
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         run: |
           git clone --depth=1 --filter=blob:none --sparse https://github.com/wess09/AzurPilot.git AzurLaneAutoScript
           git -C AzurLaneAutoScript sparse-checkout set deploy
       - name: Distribute
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         uses: knicknic/os-specific-run@v1.0.3
         with:
           macos: |
@@ -227,7 +291,7 @@ jobs:
             mkdir -p config .venv/bin bootstrap
             cp ../../deploy.mac.yaml config/deploy.yaml
             export UV_PYTHON_INSTALL_DIR="$PWD/.venv/python"
-            uv python install --install-dir .venv/python --no-bin --managed-python 3.14.6
+            cp -a ../../.ci-cache/python .venv/python
             python_home="$(find .venv/python -maxdepth 1 -type d -name 'cpython-3.14.6-*' | head -n1)"
             uv venv --allow-existing --relocatable --python "$python_home/bin/python3.14" .venv
             uv pip install --python .venv/bin/python requests
@@ -281,7 +345,7 @@ jobs:
             mkdir -p config .venv/bin bootstrap
             cp ../../deploy.unix.yaml config/deploy.yaml
             export UV_PYTHON_INSTALL_DIR="$PWD/.venv/python"
-            uv python install --install-dir .venv/python --no-bin --managed-python 3.14.6
+            cp -a ../../.ci-cache/python .venv/python
             python_home="$(find .venv/python -maxdepth 1 -type d -name 'cpython-3.14.6-*' | head -n1)"
             uv venv --allow-existing --relocatable --python "$python_home/bin/python3.14" .venv
             uv pip install --python .venv/bin/python requests
@@ -330,7 +394,8 @@ jobs:
             mkdir -ea 0 bootstrap
             cp ..\..\deploy.windows.yaml config\deploy.yaml
             $env:UV_PYTHON_INSTALL_DIR = "$PWD\.venv\python"
-            uv python install --install-dir .venv\python --no-bin --managed-python 3.14.6
+            mkdir -ea 0 .venv
+            cp -r ..\..\.ci-cache\python .venv\python
             $python_home = Get-ChildItem .venv\python -Directory | Where-Object { $_.Name -like "cpython-3.14.6-*" } | Select-Object -First 1
             uv venv --allow-existing --relocatable --python "$($python_home.FullName)\python.exe" .venv
             uv pip install --python .venv\Scripts\python.exe requests
@@ -366,10 +431,10 @@ jobs:
               t.add('package-root/AzurLaneAutoScript', arcname='AzurLaneAutoScript')
             "@
       - name: Install Inno Setup (Windows x64 only)
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-latest' && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch')
         run: choco install innosetup --no-progress -y
       - name: Build Windows installer (Windows x64 only)
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-latest' && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch')
         shell: pwsh
         run: |
           $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
@@ -391,6 +456,7 @@ jobs:
             "/DPackageRoot=package-root\AzurLaneAutoScript" `
             "/DSetupRoot=setup"
       - name: Prepare launcher updater payload
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         uses: knicknic/os-specific-run@v1.0.3
         with:
           linux: |
@@ -421,22 +487,28 @@ jobs:
             mkdir -ea 0 launcher-updater
             cp target\release\alas-launcher.exe ("launcher-updater\\alas-launcher-windows-" + $arch + ".exe")
       - name: Upload launcher updater payload
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: launcher-updater-${{ matrix.os }}
+          compression-level: 0
           path: launcher-updater/*
       - name: Upload artifacts
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: package-${{ matrix.os }}
+          compression-level: 0
           path: |
             AzurLaneAutoScript-${{ runner.os }}-*
             AP-${{ runner.os }}-*
             AzurPilot_Setup_*.exe
       - name: Upload artifacts (CN)
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: package-CN-${{ matrix.os }}
+          compression-level: 0
           path: |
             AzurLaneAutoScript-CN-${{ runner.os }}-*
             AP-CN-${{ runner.os }}-*
