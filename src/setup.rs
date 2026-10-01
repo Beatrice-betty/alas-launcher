@@ -193,7 +193,7 @@ fn platform_git_config_path() -> &'static str {
     }
 }
 
-pub(crate) fn alas_repo_dir() -> PathBuf {
+pub fn alas_repo_dir() -> PathBuf {
     // Always check if this is a typical same-folder portable distribution
     let exe_folder = std::env::current_exe()
         .unwrap()
@@ -953,7 +953,7 @@ fn run_command_with_retry(
     unreachable!()
 }
 
-fn run_status_command(
+pub fn run_status_command(
     cmd: &mut Command,
     cancel_requested: &AtomicBool,
 ) -> Result<std::process::ExitStatus> {
