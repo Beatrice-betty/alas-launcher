@@ -3768,7 +3768,7 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     width: 60px;
     height: 40px;
     object-fit: contain;
-    transform: translate(-50%, -100%);
+    transform: translate(-50%, -80%);
     pointer-events: none;
     user-select: none;
     transition: left 0.35s cubic-bezier(.23, 1, .32, 1);
