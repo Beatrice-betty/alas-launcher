@@ -33,6 +33,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Test splash progress rendering
+        run: node --test tests/splash-progress.test.cjs
+
       - name: Install Tauri dependencies (Ubuntu only)
         if: runner.os == 'Linux'
         run: |

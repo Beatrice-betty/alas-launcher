@@ -33,6 +33,8 @@ mod launcher_control;
 mod nodejs;
 /// SSE 通知流：接收后端推送的系统通知与点击回调。
 mod notify;
+/// 统一的启动进度状态、快照与推送节奏。
+mod progress;
 /// 首次启动环境准备（deploy.yaml、仓库克隆/更新、依赖同步）。
 mod setup;
 /// 窗口工具（控制台附着状态等平台辅助）。
@@ -43,7 +45,6 @@ extern crate rust_i18n;
 i18n!("locales", fallback = "en");
 
 use std::{
-    cell::Cell,
     collections::HashMap,
     fs,
     io::{Read, Write},
@@ -62,6 +63,7 @@ use crate::{
     backend::{is_backend_startup_timeout, ManagedBackend, WebuiLaunchConfig},
     launcher_control::start_launcher_control_stream,
     notify::{start_notify_stream, NotificationClickHandler},
+    progress::SplashProgress,
     setup::{
         get_deploy_config, rebuild_venv_and_sync_dependencies, reset_venv_for_rebuild,
         setup_alas_repo, setup_environment, SplashUpdate,
@@ -383,7 +385,8 @@ fn begin_startup_cleanup(
                 t!("dialog.cleaning_env_detail"),
                 99,
             )
-            .with_subtitle(t!("dialog.cleaning_wait")),
+            .with_subtitle(t!("dialog.cleaning_wait"))
+            .with_terminal(),
         );
     }
 
@@ -421,7 +424,8 @@ fn begin_startup_cleanup(
                             t!("dialog.cleanup_failed"),
                             t!("dialog.cleanup_failed_detail", error = format!("{e:#}")),
                             99,
-                        ),
+                        )
+                        .with_terminal(),
                     );
                 }
                 // 清理失败：复位标志允许再次触发，不放行退出。
@@ -1040,7 +1044,6 @@ fn download_launcher_update_parallel(
 
     let started_at = Instant::now();
     let mut downloaded_so_far = 0u64;
-    let mut last_reported_progress = LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START;
     let mut last_reported_at = Instant::now() - Duration::from_secs(1);
     // 每 100ms 醒一次：汇总各 worker 上报的进度增量并节流刷新 splash。
     while workers.iter().any(|worker| !worker.is_finished()) {
@@ -1052,7 +1055,6 @@ fn download_launcher_update_parallel(
                     downloaded_so_far,
                     total_bytes,
                     started_at,
-                    &mut last_reported_progress,
                     &mut last_reported_at,
                 );
             }
@@ -1088,7 +1090,6 @@ fn download_launcher_update_parallel(
         total_bytes,
         total_bytes,
         started_at,
-        &mut last_reported_progress,
         &mut last_reported_at,
     );
     let merged_bytes = merge_launcher_update_chunks(&chunk_paths, part_path)?;
@@ -1212,22 +1213,17 @@ fn merge_launcher_update_chunks(chunk_paths: &[PathBuf], part_path: &Path) -> Re
     Ok(written)
 }
 
-/// 汇总并行下载进度并节流刷新 splash：进度百分比提升时立即刷新，否则
-/// 至多每 250ms 刷新一次，避免高频更新拖慢 UI。
+/// 汇总下载字节，以 100ms 节奏上报；保留小数且完成时立即上报。
 fn report_launcher_update_download_progress(
     status_updater: &mut impl FnMut(SplashUpdate),
     downloaded: u64,
     total_bytes: u64,
     started_at: Instant,
-    last_reported_progress: &mut u8,
     last_reported_at: &mut Instant,
 ) {
-    let (progress, detail) =
-        launcher_download_progress_detail(downloaded, Some(total_bytes), started_at);
-    if progress > *last_reported_progress
-        || last_reported_at.elapsed() >= Duration::from_millis(250)
-    {
-        *last_reported_progress = progress;
+    if last_reported_at.elapsed() >= progress::UPDATE_INTERVAL || downloaded >= total_bytes {
+        let (progress, detail) =
+            launcher_download_progress_detail(downloaded, Some(total_bytes), started_at);
         *last_reported_at = Instant::now();
         status_updater(
             SplashUpdate::loading(t!("launcher_update.updating"), detail, progress)
@@ -1326,7 +1322,6 @@ fn download_launcher_update_sequential(
     })?;
     let mut downloaded = 0u64;
     let mut buffer = [0u8; 128 * 1024];
-    let mut last_reported_progress = LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START;
     let mut last_reported_at = Instant::now() - Duration::from_secs(1);
     let download_started_at = Instant::now();
 
@@ -1345,13 +1340,9 @@ fn download_launcher_update_sequential(
         })?;
         downloaded += size as u64;
 
-        // 进度刷新节流：百分比提升立即刷，否则至多每 250ms 一次。
-        let (progress, detail) =
-            launcher_download_progress_detail(downloaded, total_bytes, download_started_at);
-        if progress > last_reported_progress
-            || last_reported_at.elapsed() >= Duration::from_millis(250)
-        {
-            last_reported_progress = progress;
+        if last_reported_at.elapsed() >= progress::UPDATE_INTERVAL {
+            let (progress, detail) =
+                launcher_download_progress_detail(downloaded, total_bytes, download_started_at);
             last_reported_at = Instant::now();
             status_updater(
                 SplashUpdate::loading(t!("launcher_update.updating"), detail, progress)
@@ -1377,6 +1368,15 @@ fn download_launcher_update_sequential(
         }
     }
 
+    let (_, detail) = launcher_download_progress_detail(downloaded, total_bytes, download_started_at);
+    status_updater(
+        SplashUpdate::loading(
+            t!("launcher_update.updating"),
+            detail,
+            LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END,
+        )
+        .with_subtitle(t!("launcher_update.status")),
+    );
     Ok(downloaded)
 }
 
@@ -1409,31 +1409,28 @@ fn launcher_download_progress_detail(
     downloaded: u64,
     total_bytes: Option<u64>,
     started_at: Instant,
-) -> (u8, String) {
+) -> (f64, String) {
     let speed = format_speed(download_speed_bytes_per_second(downloaded, started_at));
     if let Some(total) = total_bytes.filter(|total| *total > 0) {
-        let percentage = (downloaded.min(total).saturating_mul(100) / total) as u8;
+        let percentage = downloaded.min(total) as f64 / total as f64 * 100.0;
         let detail = t!(
             "launcher_update.downloading_detail",
             downloaded = format_bytes(downloaded),
             total = format_bytes(total),
-            percent = percentage.to_string(),
+            percent = (percentage.floor() as u8).to_string(),
             speed = speed
         )
         .to_string();
         let progress_span =
             LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END - LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START;
-        let progress = LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START
-            + ((u16::from(percentage) * u16::from(progress_span)) / 100) as u8;
+        let progress = f64::from(LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START)
+            + percentage * f64::from(progress_span) / 100.0;
         return (progress, detail);
     }
 
-    let mib_downloaded = downloaded / (1024 * 1024);
-    let progress = (LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START
-        + mib_downloaded.min(u64::from(
-            LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END - LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START,
-        )) as u8)
-        .min(LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END);
+    let mib_downloaded = downloaded as f64 / (1024.0 * 1024.0);
+    let progress = (f64::from(LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START) + mib_downloaded)
+        .min(f64::from(LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END));
     let detail = t!(
         "launcher_update.downloading_detail_unknown",
         downloaded = format_bytes(downloaded),
@@ -1847,7 +1844,6 @@ mod tests {
 
     /// backend_unready_error 携带日志失败原因时拼接展示，无原因时保持原样。
     #[test]
-    #[test]
     fn backend_unready_error_carries_the_reason_from_the_log() {
         let with_reason = backend_unready_error(
             anyhow!("connect failed"),
@@ -1860,6 +1856,7 @@ mod tests {
     }
 
     /// 英文环境下 splash HTML 的文案应来自 JSON 字面量（而非 JS 单引号拼接）。
+    #[test]
     fn test_english_splash_i18n_uses_json_literals() {
         rust_i18n::set_locale("en");
 
@@ -2214,7 +2211,7 @@ mod tests {
         assert_eq!(merged.as_slice(), payload.as_slice());
         assert!(progress
             .iter()
-            .any(|value| *value > LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START));
+            .any(|value| *value > f64::from(LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START)));
         server.join().expect("range server completed");
     }
 
@@ -2460,7 +2457,9 @@ fn main() -> Result<()> {
         .register_uri_scheme_protocol("alas-splash", |_ctx, _request| splash_response())
         // 注册前端可调用的 Tauri 命令：文件保存、日志下载、窗口控制等。
         .manage(ExitControl(allow_exit.clone()))
+        .manage(Arc::new(SplashProgress::default()))
         .invoke_handler(tauri::generate_handler![
+            splash_ready,
             save_as,
             download_today_gui_log,
             download_today_launcher_log,
@@ -2645,12 +2644,11 @@ fn main() -> Result<()> {
                         setup_running.store(true, Ordering::SeqCst);
                         // splash 由 tauri.conf.json 静态声明，此处必然能取到。
                         let splash = app_handle.get_webview_window("splash").unwrap();
+                        let progress = app_handle.state::<Arc<SplashProgress>>().inner().clone();
+                        start_splash_dispatcher(&splash, progress.clone());
                         initialize_splash(&splash, !start_minimized);
-                        // 进度只升不降：记录历史最高值，防止不同阶段进度回跳。
-                        let last_progress = Cell::new(0u8);
-                        let mut status_updater = |mut update: SplashUpdate| {
-                            update.progress = update.progress.max(last_progress.get());
-                            last_progress.set(update.progress);
+                        // 所有来源（包括自更新与取消清理）共用同一个进度状态。
+                        let mut status_updater = |update: SplashUpdate| {
                             update_splash(&splash, &update);
                         };
 
@@ -2669,15 +2667,7 @@ fn main() -> Result<()> {
 
                         // 启动器自更新检查：成功替换重启时直接退出本进程交棒新版本。
                         if !preview_no_update {
-                            // 自更新的进度单独记一条"历史最高"，与主流程互不回退。
-                            let launcher_progress = Cell::new(0u8);
-                            let mut launcher_status_updater = |mut update: SplashUpdate| {
-                                update.progress = update.progress.max(launcher_progress.get());
-                                launcher_progress.set(update.progress);
-                                update_splash(&splash, &update);
-                            };
-
-                            match check_launcher_update_and_restart(&mut launcher_status_updater) {
+                            match check_launcher_update_and_restart(&mut status_updater) {
                                 Ok(true) => {
                                     info!("Launcher update installed, restarting");
                                     setup_completed.store(true, Ordering::SeqCst);
@@ -2692,13 +2682,13 @@ fn main() -> Result<()> {
                                     if start_minimized {
                                         let _ = reveal_window(&splash);
                                     }
-                                    launcher_status_updater(SplashUpdate::error(
+                                    status_updater(SplashUpdate::error(
                                         t!("launcher_update.failed"),
                                         t!(
                                             "launcher_update.failed_detail",
                                             error = format!("{e:#}")
                                         ),
-                                        launcher_progress.get().max(8),
+                                        progress.progress().max(8.0),
                                     ));
                                     setup_completed.store(true, Ordering::SeqCst);
                                     setup_running.store(false, Ordering::SeqCst);
@@ -2764,7 +2754,7 @@ fn main() -> Result<()> {
                             status_updater(SplashUpdate::error(
                                 t!("dialog.startup_failed"),
                                 t!("dialog.repo_setup_failed", error = e.to_string()),
-                                last_progress.get().max(8),
+                                progress.progress().max(8.0),
                             ));
                             return;
                         }
@@ -2840,7 +2830,7 @@ fn main() -> Result<()> {
                                 status_updater(SplashUpdate::error(
                                     t!("dialog.startup_failed"),
                                     t!("dialog.backend_launch_failed", error = e.to_string()),
-                                    last_progress.get().max(97),
+                                    progress.progress().max(97.0),
                                 ));
                                 return;
                             }
@@ -2877,6 +2867,9 @@ fn main() -> Result<()> {
                                 )),
                         );
                         // 一切就绪：销毁 splash，主窗口导航到 WebUI 后按需显示。
+                        if let Some(update) = progress.close() {
+                            dispatch_splash_update(&splash, &update);
+                        }
                         let _ = splash.destroy();
                         debug!("Destroyed splash window after startup");
 
@@ -3340,37 +3333,43 @@ fn initialize_splash(splash: &WebviewWindow, show_window: bool) {
     }
 }
 
-/// 轮询探测 splash 页面是否就绪：执行一段检查 __ALAS_SPLASH_READY 标志的
-/// JS，eval 成功即认为页面的更新回调已挂好、可以接收进度推送。
+/// 等待页面通过 IPC 确认回调已挂载；eval 返回成功仅表示脚本已排队。
 fn wait_for_splash_ready(splash: &WebviewWindow, timeout: Duration) -> bool {
-    let started_at = Instant::now();
-    while started_at.elapsed() < timeout {
-        if splash
-            .eval(
-                r#"
-                if (!window.__ALAS_SPLASH_READY) {
-                    throw new Error("splash page is not ready");
-                }
-                "#,
-            )
-            .is_ok()
-        {
-            return true;
-        }
-        // 25ms 轮询：足够灵敏且不给 WebView 造成明显压力。
-        thread::sleep(Duration::from_millis(25));
-    }
-    false
+    splash.state::<Arc<SplashProgress>>().wait_until_ready(timeout)
 }
 
-/// 把 SplashUpdate 序列化为 JSON 并调用 splash 页面的
-/// window.__ALAS_SPLASH_UPDATE 回调刷新界面。
-fn update_splash(splash: &WebviewWindow, update: &SplashUpdate) {
-    let payload = to_string(update).unwrap();
+#[tauri::command]
+fn splash_ready(
+    window: WebviewWindow,
+    progress: State<'_, Arc<SplashProgress>>,
+) -> Result<Option<SplashUpdate>, String> {
+    if window.label() != "splash" {
+        return Err("Splash readiness is only available to the splash window".to_string());
+    }
+    Ok(progress.ready())
+}
+
+/// 唯一的 WebView 推送线程，以最新快照合并高频日志事件。
+fn start_splash_dispatcher(splash: &WebviewWindow, progress: Arc<SplashProgress>) {
+    let splash = splash.clone();
+    thread::spawn(move || {
+        while let Some(update) = progress.next_update() {
+            dispatch_splash_update(&splash, &update);
+        }
+    });
+}
+
+fn dispatch_splash_update(splash: &WebviewWindow, update: &SplashUpdate) {
+    let payload = to_string(update).expect("finite splash progress serializes");
     let script = format!("window.__ALAS_SPLASH_UPDATE && window.__ALAS_SPLASH_UPDATE({payload});");
     if let Err(e) = splash.eval(&script) {
         error!("Failed to update splash page: {:?}", e);
     }
+}
+
+/// 发布状态；进度去重、防回退与定频推送统一由 SplashProgress 负责。
+fn update_splash(splash: &WebviewWindow, update: &SplashUpdate) {
+    splash.state::<Arc<SplashProgress>>().publish(update.clone());
 }
 
 /// 拼接后端 WebUI 的本地地址（http://127.0.0.1:{port}/）。
@@ -4308,26 +4307,27 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     backdrop-filter: blur(8px);
   }
   .progress-bar-fill {
-    width: 4%;
+    width: 100%;
+    transform: scaleX(0);
+    transform-origin: left center;
     height: 100%;
     border-radius: inherit;
     background: linear-gradient(90deg, #4facfe, #43d7f5);
     box-shadow: 0 0 10px rgba(67, 215, 245, 0.38);
     position: relative;
     overflow: hidden;
-    transition: width 0.35s cubic-bezier(.23, 1, .32, 1), background-color 0.2s ease;
+    transition: background-color 0.2s ease;
   }
   .progress-head {
     position: absolute;
-    left: clamp(30px, var(--progress, 4%), calc(100% - 30px));
+    left: 0;
     top: 50%;
     width: 60px;
     height: 40px;
     object-fit: contain;
-    transform: translate(-50%, -80%);
+    transform: translate3d(30px, -80%, 0) translateX(-50%);
     pointer-events: none;
     user-select: none;
-    transition: left 0.35s cubic-bezier(.23, 1, .32, 1);
   }
   .progress-bar-fill::after {
     display: none;
@@ -4385,13 +4385,14 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
   }
   .uv-progress-bar-fill {
     position: relative;
-    width: 2%;
+    width: 100%;
+    transform: scaleX(0);
+    transform-origin: left center;
     height: 100%;
     overflow: hidden;
     border-radius: inherit;
     background: #55cda0;
     box-shadow: 0 0 8px rgba(85, 205, 160, 0.34);
-    transition: width 0.4s cubic-bezier(.23, 1, .32, 1);
   }
   .uv-progress-bar-fill::after {
     display: none;
@@ -4571,10 +4572,10 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
       </div>
 
       <div class="progress-container">
-        <div id="progress-pct" class="progress-percentage">4%</div>
+        <div id="progress-pct" class="progress-percentage">0%</div>
         <div class="progress-bar-bg">
-          <div id="progress-fill" class="progress-bar-fill" style="width: 4%;"></div>
-          <img class="progress-head" src="data:image/webp;base64,$PROGRESS_HEAD" alt="" aria-hidden="true" draggable="false">
+          <div id="progress-fill" class="progress-bar-fill" role="progressbar" aria-label="$I18N_INITIALIZING" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+          <img id="progress-head" class="progress-head" src="data:image/webp;base64,$PROGRESS_HEAD" alt="" aria-hidden="true" draggable="false">
         </div>
       </div>
 
@@ -4584,7 +4585,7 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
           <span id="uv-progress-pct">0%</span>
         </div>
         <div class="uv-progress-bar-bg">
-          <div id="uv-progress-fill" class="uv-progress-bar-fill" style="width: 2%;"></div>
+          <div id="uv-progress-fill" class="uv-progress-bar-fill" role="progressbar" aria-labelledby="uv-progress-detail" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
         </div>
       </div>
 
@@ -4632,63 +4633,7 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
       return text || i18n.webuiInit;
     }
 
-    window.__ALAS_SPLASH_UPDATE = function (payload) {
-      const badge = document.getElementById('badge');
-      const badgeText = document.getElementById('badge-text');
-      const spinner = document.getElementById('spinner');
-      const errorDot = document.getElementById('error-dot');
-      const progressFill = document.getElementById('progress-fill');
-      const progressPct = document.getElementById('progress-pct');
-      const uvProgressContainer = document.getElementById('uv-progress-container');
-      const uvProgressFill = document.getElementById('uv-progress-fill');
-      const uvProgressPct = document.getElementById('uv-progress-pct');
-      const uvProgressDetail = document.getElementById('uv-progress-detail');
-      const progressMeta = document.getElementById('progress-meta');
-      const splashActions = document.getElementById('splash-actions');
-      const subtitle = splitSubtitle(payload.subtitle);
-
-      badgeText.textContent = payload.is_error ? i18n.errorBadge : subtitle.status;
-      document.getElementById('tip-text').textContent = subtitle.tip;
-      document.getElementById('title').textContent = payload.title || i18n.starting;
-      document.getElementById('detail').textContent = normalizeDetail(payload.detail);
-      progressMeta.textContent = payload.is_error
-        ? i18n.initStopped
-        : i18n.progressMetaReady;
-
-      const progress = Math.max(0, Math.min(100, Number(payload.progress || 0)));
-      progressFill.style.width = progress + '%';
-      progressFill.parentElement.style.setProperty('--progress', progress + '%');
-      progressPct.textContent = progress + '%';
-
-      const uvState = payload.uv_progress;
-      const hasUvProgress = !payload.is_error
-        && uvState
-        && Number.isFinite(Number(uvState.progress));
-      uvProgressContainer.classList.toggle('is-visible', Boolean(hasUvProgress));
-      uvProgressContainer.setAttribute('aria-hidden', String(!hasUvProgress));
-      if (hasUvProgress) {
-        const uvProgress = Math.max(0, Math.min(99, Number(uvState.progress)));
-        uvProgressFill.style.width = uvProgress + '%';
-        uvProgressPct.textContent = uvProgress + '%';
-        uvProgressDetail.textContent = String(uvState.detail || '');
-      }
-
-      if (payload.is_error) {
-        document.body.classList.add('error-state');
-        badge.className = 'status-badge status-badge-err';
-        spinner.style.display = 'none';
-        errorDot.style.display = 'flex';
-        progressFill.className = 'progress-bar-fill progress-bar-fill-error';
-        splashActions.className = 'splash-actions splash-actions-err';
-      } else {
-        document.body.classList.remove('error-state');
-        badge.className = 'status-badge';
-        spinner.style.display = 'block';
-        errorDot.style.display = 'none';
-        progressFill.className = 'progress-bar-fill';
-        splashActions.className = 'splash-actions';
-      }
-    };
+    $SPLASH_PROGRESS_SCRIPT
 
     const splashDragRegion = document.getElementById('splash-drag-region');
     splashDragRegion.addEventListener('pointerdown', event => {
@@ -4743,7 +4688,6 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
       }
     });
 
-    window.__ALAS_SPLASH_READY = true;
   </script>
 </body>
 </html>"#
@@ -4755,6 +4699,7 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     .replace("$MI_SANS_FONT", mi_sans_font_b64)
     .replace("$LAUNCHER_VERSION", env!("CARGO_PKG_VERSION"))
     .replace("$I18N_JSON", &i18n_json)
+    .replace("$SPLASH_PROGRESS_SCRIPT", include_str!("splash-progress.js"))
     .replace("$NATIVE_TOUCH_DRAG", if cfg!(windows) { "true" } else { "false" })
     .replace("$I18N_INITIALIZING", &escape_html(t!("splash.initializing")))
     .replace("$I18N_MINIMIZE", &escape_html(t!("titlebar.minimize")))

@@ -123,6 +123,16 @@ locales/
 - `alas-splash://`（Windows/Android 用 `http://alas-splash.localhost/`）：内嵌启动画面 HTML/CSS/JS，进度条通过 `window.__ALAS_SPLASH_UPDATE()` 回调更新
 - `alas-error://`（Windows/Android 用 `http://alas-error.localhost/`）：后端连接失败页面，每秒自动重试连接
 
+### 启动进度
+
+`src/progress.rs` 是启动进度的唯一状态源。运行时工具、Git、uv、Node.js、自更新及退出清理均发布 `SplashUpdate`，进度保留小数精度。主条和同一任务的 uv 子条分别保存历史最高值，镜像重试或子条暂时隐藏时不会回退。每次依赖同步入口使用 `with_new_uv_task()` 分配新的 `task_id`；后端超时重建是新的子任务，子条重新开始，主条保留已达到的进度。退出清理使用 `with_terminal()` 拒绝后台迟到的普通状态；一般错误仍可恢复（例如 Node.js 安装失败后继续启动）。
+
+页面在回调挂载后调用 `splash_ready`，取得最新快照，避免加载期间遗漏状态。推送线程只保存最新待发送快照，普通更新最多每 100ms 一次，错误、清理及完成立即发送；快照带递增 `sequence`，页面拒绝乱序或重复消息。
+
+`src/splash-progress.js` 内嵌在启动页面中，使用同一个动画时钟，在 250ms 内线性插值到已确认进度；条形与装饰头通过 `transform` 更新，百分比随呈现值取整。错误/终态及减少动态偏好立即落到确认值，后台隐藏时停止动画。只有 `uv sync` 成功退出才确认子条 100%；无精确下载数据的阶段仍使用有上限的耗时估计。
+
+前端状态回归使用 Node.js 内置测试运行器：`node --test tests/splash-progress.test.cjs`；Rust 状态与进度解析回归随 `cargo test --locked --all-targets` 运行。
+
 ### 自定义标题栏
 
 Windows 和 Linux 移除原生窗口装饰（`set_decorations(false)`），通过 `page_load_injector` 在每个页面加载完成后注入自定义标题栏 JS（红绿灯按钮 + 拖拽区域）。macOS 保留原生标题栏。注入脚本还会：

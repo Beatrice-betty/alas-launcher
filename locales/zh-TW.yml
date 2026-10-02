@@ -66,6 +66,7 @@ setup:
   uv_waiting_speed: "正在取得下載速度資料..."
   uv_downloading_detail: "已下載 %{downloaded}，速度 %{speed}/s。"
   uv_installing: "下載完成，正在安裝依賴。"
+  uv_completed: "依賴同步完成。"
   rebuilding_env: "重建執行環境中... | Tips：%{tip}"
   backend_timeout_recovery: "後端啟動逾時，正在重建 .venv 並重新同步依賴。"
   action_wait: "%{action}，請稍候。"

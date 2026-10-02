@@ -16,7 +16,7 @@ use std::{
     process::Command,
     ptr,
     sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(windows)]
@@ -373,7 +373,12 @@ fn install_nodejs_portable(
         t!("setup.downloading_nodejs", version = installer.version),
         5,
     ));
-    download_nodejs_installer(installer, &archive_path, cancel_requested)?;
+    download_nodejs_installer(
+        installer,
+        &archive_path,
+        cancel_requested,
+        &mut status_updater,
+    )?;
     verify_nodejs_installer(&archive_path, installer.sha256)?;
 
     let target = private_nodejs_directory()?;
@@ -465,7 +470,7 @@ fn install_nodejs_system_wide(
         t!("setup.downloading_nodejs", version = installer.version),
         5,
     ));
-    download_nodejs_installer(installer, &installer_path, cancel_requested)?;
+    download_nodejs_installer(installer, &installer_path, cancel_requested, status_updater)?;
     verify_nodejs_installer(&installer_path, installer.sha256)?;
 
     status_updater(SplashUpdate::loading(
@@ -786,6 +791,8 @@ fn validate_nodejs_installer_source(url: &str, digest: &str) -> Result<()> {
 
 #[cfg(windows)]
 /// 下载安装包到指定路径，边下载边计算 SHA-256，完成后与预期值比对。
+/// 已知总大小时把下载量映射到 5–6.8%，预留剩余进度给独立复验；
+/// 下载状态每 100ms 最多上报一次，避免逐块更新挤占界面线程。
 ///
 /// # Errors
 ///
@@ -795,6 +802,7 @@ fn download_nodejs_installer(
     installer: NodeJsInstaller,
     part_path: &Path,
     cancel_requested: &AtomicBool,
+    status_updater: &mut impl FnMut(SplashUpdate),
 ) -> Result<()> {
     // 慢速网络也能完整下载：连接超时 20 秒，总超时放宽到 15 分钟。
     let client = Client::builder()
@@ -808,10 +816,14 @@ fn download_nodejs_installer(
         .context("download Node.js installer")?
         .error_for_status()
         .context("Node.js installer download returned an error status")?;
+    let total_bytes = response.content_length().filter(|total| *total > 0);
     let mut destination = File::create(part_path).context("create Node.js installer part file")?;
     let mut digest = Sha256::new();
     // 流式读取并同步计算摘要，无需把整个安装包载入内存。
     let mut buffer = [0u8; NODEJS_DOWNLOAD_BUFFER_BYTES];
+    let started_at = Instant::now();
+    let mut last_reported_at = started_at - Duration::from_millis(100);
+    let mut downloaded = 0u64;
 
     // 每读一块数据都检查取消标志，保证长时间下载可随时中断。
     loop {
@@ -828,10 +840,53 @@ fn download_nodejs_installer(
             .write_all(&buffer[..read])
             .context("write Node.js installer part file")?;
         digest.update(&buffer[..read]);
+        downloaded = downloaded.saturating_add(read as u64);
+        if last_reported_at.elapsed() >= Duration::from_millis(100) {
+            last_reported_at = Instant::now();
+            let speed = crate::format_speed(crate::download_speed_bytes_per_second(
+                downloaded, started_at,
+            ));
+            let (progress, detail) = match total_bytes {
+                Some(total) => {
+                    let fraction = downloaded.min(total) as f64 / total as f64;
+                    (
+                        5.0 + 1.8 * fraction,
+                        t!(
+                            "launcher_update.downloading_detail",
+                            downloaded = crate::format_bytes(downloaded),
+                            total = crate::format_bytes(total),
+                            percent = format!("{:.0}", (fraction * 100.0).floor()),
+                            speed = speed
+                        )
+                        .to_string(),
+                    )
+                }
+                None => (
+                    5.0,
+                    t!(
+                        "launcher_update.downloading_detail_unknown",
+                        downloaded = crate::format_bytes(downloaded),
+                        speed = speed
+                    )
+                    .to_string(),
+                ),
+            };
+            status_updater(SplashUpdate::loading(
+                t!("setup.installing_nodejs"),
+                detail,
+                progress,
+            ));
+        }
     }
     destination
         .flush()
         .context("flush Node.js installer part file")?;
+
+    status_updater(SplashUpdate::loading(
+        t!("setup.installing_nodejs"),
+        t!("launcher_update.verifying_detail"),
+        6.8,
+    ));
 
     // 官方公布的摘要可能混用大小写，比较时忽略大小写差异。
     let actual = format!("{:x}", digest.finalize());

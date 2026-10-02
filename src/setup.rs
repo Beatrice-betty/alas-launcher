@@ -17,7 +17,6 @@ use chrono::Local;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT};
 use reqwest::redirect::Policy;
-use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::env::set_current_dir;
@@ -37,76 +36,7 @@ use tracing::{info, warn};
 use crate::window_util::CreateNoWindow as _;
 use rust_i18n::t;
 
-/// 启动画面的单次进度更新载荷。
-///
-/// 由 setup 各阶段构造，推送到 `alas-splash://` 页面的
-/// `window.__ALAS_SPLASH_UPDATE()`，驱动标题、进度条与提示文案。
-#[derive(Clone, Debug, Serialize)]
-pub struct SplashUpdate {
-    /// 副标题，展示随机小贴士或阶段说明。
-    pub subtitle: String,
-    /// 阶段主标题（如"更新中""安装依赖"）。
-    pub title: String,
-    /// 具体进度描述（当前正在执行的动作）。
-    pub detail: String,
-    /// 总进度百分比（0-100，超界值会被钳制）。
-    pub progress: u8,
-    /// uv 依赖同步的独立子进度；仅在 uv sync 阶段存在。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uv_progress: Option<UvProgress>,
-    /// 是否为错误状态（启动画面据此切换错误配色与文案）。
-    pub is_error: bool,
-}
-
-/// uv 依赖同步的子进度（进度条内嵌的独立分段）。
-#[derive(Clone, Debug, Serialize)]
-pub struct UvProgress {
-    /// uv 阶段的进度百分比（0-100）。
-    pub progress: u8,
-    /// uv 阶段的描述（解析/下载/安装状态与速度估算）。
-    pub detail: String,
-}
-
-impl SplashUpdate {
-    /// 构造一条"进行中"的启动画面进度，副标题固定为 i18n 的连接中文案。
-    pub fn loading(title: impl Into<String>, detail: impl Into<String>, progress: u8) -> Self {
-        Self {
-            subtitle: t!("setup.connecting").to_string(),
-            title: title.into(),
-            detail: detail.into(),
-            progress: progress.min(100),
-            uv_progress: None,
-            is_error: false,
-        }
-    }
-
-    /// 构造一条"失败"的启动画面进度，启动画面将切换为错误展示样式。
-    pub fn error(title: impl Into<String>, detail: impl Into<String>, progress: u8) -> Self {
-        Self {
-            subtitle: t!("setup.connection_failed").to_string(),
-            title: title.into(),
-            detail: detail.into(),
-            progress: progress.min(100),
-            uv_progress: None,
-            is_error: true,
-        }
-    }
-
-    /// 覆盖副标题文案（如随机小贴士）。
-    pub fn with_subtitle(mut self, subtitle: impl Into<String>) -> Self {
-        self.subtitle = subtitle.into();
-        self
-    }
-
-    /// 附加 uv 同步子进度（独立进度值与阶段描述）。
-    pub fn with_uv_progress(mut self, progress: u8, detail: impl Into<String>) -> Self {
-        self.uv_progress = Some(UvProgress {
-            progress: progress.min(100),
-            detail: detail.into(),
-        });
-        self
-    }
-}
+pub use crate::progress::SplashUpdate;
 
 /// 启动画面小贴士总数，需与 locales 中 `tips.*` 键的数量保持一致。
 const TIPS_COUNT: usize = 19;
@@ -132,7 +62,7 @@ enum ScriptPhase {
 #[derive(Default)]
 struct GitProgressState {
     /// 当前累计进度百分比。
-    progress: u8,
+    progress: f64,
 }
 
 /// uv sync 输出解析状态机：跟踪解析/下载/安装各阶段并估算整体进度。
@@ -154,7 +84,7 @@ struct UvProgressState {
     /// 安装是否已完成。
     installed: bool,
     /// 上一次上报的进度，用于保证进度单调不回退。
-    last_progress: u8,
+    last_progress: f64,
 }
 
 impl UvProgressState {
@@ -169,7 +99,7 @@ impl UvProgressState {
             resolved: false,
             prepared: false,
             installed: false,
-            last_progress: 2,
+            last_progress: 2.0,
         }
     }
 }
@@ -1013,7 +943,7 @@ fn pipe_lines(read: impl Read + Send + 'static, tx: Sender<(bool, String)>, is_e
 /// 子进程的 stdout/stderr 各由一个读取线程消费（见 [`pipe_lines`]），
 /// 主循环经通道收取事件：可识别为进度的行驱动启动画面更新，普通
 /// 输出写日志，stderr 行同时记为"最后错误"用于失败时展示。
-/// 依赖阶段在 1 秒无输出时也会发出等待进度，避免画面长时间静止。
+/// 依赖阶段每 100ms 按实际耗时刷新等待进度，持续有日志时同样刷新。
 ///
 /// # Errors
 /// 用户取消（会先杀掉子进程）、子进程启动失败或非零退出时返回 Err。
@@ -1051,8 +981,15 @@ fn run_command(
     let mut git_progress = GitProgressState::default();
     let mut uv_progress = UvProgressState::new();
     // 依赖阶段起点 64%：前半段留给 git 更新，保证总进度单调
-    let mut dependency_progress = 64u8;
-    let mut dependency_elapsed_secs = 0u16;
+    let mut dependency_progress = 64.0;
+    let phase_subtitle = match phase {
+        ScriptPhase::Git => t!("setup.syncing", tip = get_tip()).to_string(),
+        ScriptPhase::Dependencies => t!("setup.syncing_deps", tip = get_tip()).to_string(),
+    };
+    let mut dependency_detail = None;
+    let started_at = Instant::now();
+    let mut last_wait_update = started_at;
+    const UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
     // 主循环：收取输出行，转发到日志与启动画面进度回调
     loop {
@@ -1062,8 +999,8 @@ fn run_command(
             let _ = child.wait();
             bail!(t!("setup.cancel_cleaning"));
         }
-        // 带 1 秒超时收取：超时分支用于在无输出时刷新等待进度
-        match rx.recv_timeout(Duration::from_secs(1)) {
+        // 短超时保证无输出时的取消与进度刷新也及时响应。
+        match rx.recv_timeout(UPDATE_INTERVAL) {
             Ok((is_err, line)) => {
                 if let Some(mut update) =
                     splash_update_for_output(&line, phase, &mut git_progress, &mut uv_progress)
@@ -1072,7 +1009,9 @@ fn run_command(
                     if is_deps {
                         update.progress = update.progress.max(dependency_progress);
                         dependency_progress = update.progress;
+                        dependency_detail = Some(update.detail.clone());
                     }
+                    update.subtitle = phase_subtitle.clone();
                     status_updater(update);
                 }
 
@@ -1089,22 +1028,32 @@ fn run_command(
                     info!("{line}");
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
-                if is_deps {
-                    dependency_elapsed_secs = dependency_elapsed_secs.saturating_add(1);
-                    let update = dependency_wait_update(
-                        dependency_elapsed_secs,
-                        dependency_progress,
-                        &mut uv_progress,
-                    );
-                    dependency_progress = update.progress;
-                    status_updater(update);
-                }
-            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                // 两个读取线程都已结束（含 sender 被 drop），子进程输出完毕
-                break;
+                // 读取线程结束后仍需轮询子进程退出，避免它主动关闭输出
+                // 后继续运行时阻塞在 wait()，让取消与等待进度保持响应。
+                if child.try_wait()?.is_some() {
+                    break;
+                }
+                thread::sleep(UPDATE_INTERVAL);
             }
+        }
+
+        // 进度时钟独立于日志频率，避免持续有普通日志时等待进度停住，
+        // 也避免把“超时次数”误当成真实耗时。
+        if is_deps && last_wait_update.elapsed() >= UPDATE_INTERVAL {
+            let mut update = dependency_wait_update(
+                started_at.elapsed().as_secs(),
+                dependency_progress,
+                &mut uv_progress,
+            );
+            update.subtitle = phase_subtitle.clone();
+            if let Some(detail) = &dependency_detail {
+                update.detail = detail.clone();
+            }
+            dependency_progress = update.progress;
+            status_updater(update);
+            last_wait_update = Instant::now();
         }
     }
 
@@ -1240,13 +1189,20 @@ fn dependency_start_update() -> SplashUpdate {
         .with_uv_progress(2, t!("setup.uv_resolving", secs = "0"))
 }
 
+/// 子命令成功退出后确认依赖同步完成，推进到本阶段的终点。
+fn dependency_complete_update() -> SplashUpdate {
+    SplashUpdate::loading(t!("setup.installing_deps"), t!("setup.uv_completed"), 90)
+        .with_subtitle(t!("setup.syncing_deps", tip = get_tip()))
+        .with_uv_progress(100, t!("setup.uv_completed"))
+}
+
 /// 构造依赖同步阶段"等待中"的进度（子命令暂时无输出时保持画面活跃）。
 ///
 /// 按已等待秒数切换文案（10 秒内显示"解析中"，之后显示已耗时），
 /// 进度取当前值与全局 uv 进度的较大者，保证单调。
 fn dependency_wait_update(
-    elapsed_secs: u16,
-    current_progress: u8,
+    elapsed_secs: u64,
+    current_progress: f64,
     uv_progress: &mut UvProgressState,
 ) -> SplashUpdate {
     let progress = current_progress.max(dependency_global_progress(uv_progress.progress()));
@@ -1293,7 +1249,7 @@ gm.git_install()
     run_command_with_retry(
         || {
             let mut cmd = Command::new(&python);
-            cmd.args(["-c", script])
+            cmd.args(["-u", "-c", script])
                 .env("AZURPILOT_BOOTSTRAP_UV", &bootstrap_uv);
             isolate_python_child_environment(&mut cmd);
             bypass_proxy_for_child(&mut cmd);
@@ -1319,6 +1275,8 @@ fn uv_sync_project(
     cancel_requested: &AtomicBool,
 ) -> Result<()> {
     let bootstrap_uv = bootstrap_uv.to_path_buf();
+    // 独立同步任务从新子进度开始；同一任务内部的换源与重锁沿用任务。
+    status_updater(dependency_start_update().with_new_uv_task());
     let indexes = ranked_pypi_indexes();
     let next_indexes = indexes.clone();
     let mut last_error = None;
@@ -1334,7 +1292,13 @@ fn uv_sync_project(
         // uv.lock 锁定了下载 URL，且 uv 只有在锁定的 URL 失效时才会重写，
         // 所以必须先把锁解析到当前镜像源上——这决定了实际从哪个源下载；
         // 无法完成解析的源等于不可用，直接跳过。
-        if !relock_onto_index(&bootstrap_uv, index, cancel_requested, &mut last_error) {
+        if !relock_onto_index(
+            &bootstrap_uv,
+            index,
+            &mut status_updater,
+            cancel_requested,
+            &mut last_error,
+        ) {
             if !disable_index(index, &next_indexes, attempt, &mut status_updater) {
                 break;
             }
@@ -1354,15 +1318,19 @@ fn uv_sync_project(
         // 探测可达的镜像仍可能在下载环节失败（403、限流、CDN 损坏、
         // 包格式不被 uv 识别等），先重锁一次再试，然后才判定该源不可用。
         info!("Retrying dependency sync with relocked URLs for {index}");
-        if relock_onto_index(&bootstrap_uv, index, cancel_requested, &mut last_error)
-            && sync_succeeds(
-                &bootstrap_uv,
-                index,
-                &mut status_updater,
-                cancel_requested,
-                &mut last_error,
-            )
-        {
+        if relock_onto_index(
+            &bootstrap_uv,
+            index,
+            &mut status_updater,
+            cancel_requested,
+            &mut last_error,
+        ) && sync_succeeds(
+            &bootstrap_uv,
+            index,
+            &mut status_updater,
+            cancel_requested,
+            &mut last_error,
+        ) {
             return Ok(());
         }
 
@@ -1381,10 +1349,11 @@ fn uv_sync_project(
 fn relock_onto_index(
     bootstrap_uv: &Path,
     index: &str,
+    status_updater: &mut impl FnMut(SplashUpdate),
     cancel_requested: &AtomicBool,
     last_error: &mut Option<anyhow::Error>,
 ) -> bool {
-    match uv_relock_project(bootstrap_uv, index, cancel_requested) {
+    match uv_relock_project(bootstrap_uv, index, status_updater, cancel_requested) {
         Ok(()) => {
             info!("Re-resolved uv.lock onto PyPI index: {index}");
             true
@@ -1408,11 +1377,15 @@ fn sync_succeeds(
     let mut cmd = uv_sync_command(bootstrap_uv, index);
     match run_command(
         &mut cmd,
-        status_updater,
+        &mut *status_updater,
         ScriptPhase::Dependencies,
         cancel_requested,
     ) {
-        Ok(()) => true,
+        Ok(()) => {
+            // 只有 sync 退出成功才能报完成；安装日志仍可能先于失败退出码。
+            status_updater(dependency_complete_update());
+            true
+        }
         Err(err) => {
             warn!("Dependency sync failed with PyPI index {index}: {err}");
             *last_error = Some(err);
@@ -1447,13 +1420,14 @@ fn disable_index(
 fn uv_relock_project(
     bootstrap_uv: &Path,
     index: &str,
+    status_updater: &mut impl FnMut(SplashUpdate),
     cancel_requested: &AtomicBool,
 ) -> Result<()> {
     let override_file = UvIndexOverride::create(index)?;
     let mut cmd = uv_lock_command(bootstrap_uv, override_file.path(), index);
     run_command(
         &mut cmd,
-        &mut |_| {},
+        status_updater,
         ScriptPhase::Dependencies,
         cancel_requested,
     )
@@ -1687,7 +1661,7 @@ fn atomic_failure_cleanup(path: &str, cancel_requested: &AtomicBool) -> Result<(
 fn runtime_tools_update(
     title: impl Into<String>,
     detail: impl Into<String>,
-    progress: u8,
+    progress: impl Into<f64>,
 ) -> SplashUpdate {
     SplashUpdate::loading(title, detail, progress)
         .with_subtitle(t!("setup.rebuilding_env", tip = get_tip()).to_string())
@@ -1698,12 +1672,15 @@ fn runtime_tools_update(
 fn runtime_wait_update(
     title: &str,
     action: &str,
-    elapsed_ticks: u16,
-    start_progress: u8,
-    end_progress: u8,
+    elapsed: Duration,
+    start_progress: f64,
+    end_progress: f64,
 ) -> SplashUpdate {
-    let elapsed_secs = elapsed_ticks / 10;
-    let progress = scale_progress(elapsed_secs.min(120) as u8, start_progress, end_progress);
+    let elapsed_secs = elapsed.as_secs();
+    // 120 秒对应整个区间，保留亚秒精度，避免一两个百分点的阶段
+    // 因整数取整而长时间静止或在 100 秒时提前抵达终点。
+    let percentage = elapsed.as_secs_f64() / 120.0 * 100.0;
+    let progress = scale_progress(percentage, start_progress, end_progress);
     let detail = if elapsed_secs < 8 {
         t!("setup.action_wait", action = action).to_string()
     } else {
@@ -2041,18 +2018,15 @@ fn ensure_deploy_python_dependencies(
         isolate_python_child_environment(&mut cmd);
         bypass_proxy_for_child(&mut cmd);
 
-        let mut elapsed_ticks = 0u16;
+        let started_at = Instant::now();
         let status = run_status_command_with_tick(&mut cmd, cancel_requested, || {
-            elapsed_ticks = elapsed_ticks.saturating_add(1);
-            if elapsed_ticks == 1 || elapsed_ticks % 10 == 0 {
-                status_updater(runtime_wait_update(
-                    &t!("setup.preparing_env"),
-                    &t!("setup.installing_requests"),
-                    elapsed_ticks,
-                    15,
-                    16,
-                ));
-            }
+            status_updater(runtime_wait_update(
+                &t!("setup.preparing_env"),
+                &t!("setup.installing_requests"),
+                started_at.elapsed(),
+                15.0,
+                16.0,
+            ));
         })?;
         if status.success() {
             return Ok(());
@@ -2187,18 +2161,15 @@ fn ensure_self_contained_python(
                     PYTHON_VERSION,
                 ]);
             uv_python_env(&mut cmd);
-            let mut elapsed_ticks = 0u16;
+            let started_at = Instant::now();
             let status = run_status_command_with_tick(&mut cmd, cancel_requested, || {
-                elapsed_ticks = elapsed_ticks.saturating_add(1);
-                if elapsed_ticks == 1 || elapsed_ticks % 10 == 0 {
-                    status_updater(runtime_wait_update(
-                        &t!("setup.download_python_title"),
-                        &t!("setup.downloading_python_action", version = PYTHON_VERSION),
-                        elapsed_ticks,
-                        11,
-                        13,
-                    ));
-                }
+                status_updater(runtime_wait_update(
+                    &t!("setup.download_python_title"),
+                    &t!("setup.downloading_python_action", version = PYTHON_VERSION),
+                    started_at.elapsed(),
+                    11.0,
+                    13.0,
+                ));
             })?;
             if status.success() {
                 downloaded = true;
@@ -2573,7 +2544,7 @@ fn splash_update_for_git_output(line: &str, state: &mut GitProgressState) -> Opt
 
     if line.contains("=====") {
         let detail = line.replace('=', " ");
-        let progress = git_section_progress(detail.trim()).unwrap_or(24);
+        let progress = git_section_progress(detail.trim()).unwrap_or(24.0);
         return Some(git_update_splash(
             line,
             detail.trim(),
@@ -2594,7 +2565,7 @@ fn splash_update_for_git_output(line: &str, state: &mut GitProgressState) -> Opt
 fn git_update_splash(
     raw_line: &str,
     detail: &str,
-    progress: u8,
+    progress: f64,
     state: &mut GitProgressState,
     subtitle: String,
 ) -> SplashUpdate {
@@ -2611,23 +2582,23 @@ fn git_update_splash(
 /// 按上游脚本的阶段标题映射预设进度点（18% 起，随阶段推进）。
 ///
 /// 标题与 `deploy/installer.py` 的输出保持一致，上游改动时需同步。
-fn git_section_progress(section: &str) -> Option<u8> {
+fn git_section_progress(section: &str) -> Option<f64> {
     if section.contains("SHOW DEPLOY CONFIG") {
-        Some(18)
+        Some(18.0)
     } else if section.contains("UPDATE AZURPILOT") {
-        Some(20)
+        Some(20.0)
     } else if section.contains("GIT INIT") {
-        Some(22)
+        Some(22.0)
     } else if section.contains("SET GIT PROXY") {
-        Some(23)
+        Some(23.0)
     } else if section.contains("SET GIT REPOSITORY") {
-        Some(24)
+        Some(24.0)
     } else if section.contains("FETCH REPOSITORY BRANCH") {
-        Some(25)
+        Some(25.0)
     } else if section.contains("PULL REPOSITORY BRANCH") {
-        Some(58)
+        Some(58.0)
     } else if section.contains("SHOW VERSION") {
-        Some(63)
+        Some(63.0)
     } else {
         None
     }
@@ -2637,7 +2608,7 @@ fn git_section_progress(section: &str) -> Option<u8> {
 ///
 /// Counting/Compressing（25-29）→ Receiving（29-52）→ Resolving
 /// deltas（52-58）→ Updating files（58-62），与阶段标题的进度点衔接。
-fn git_line_progress(line: &str) -> Option<u8> {
+fn git_line_progress(line: &str) -> Option<f64> {
     let percentage = find_percentage(line)?;
     if line.contains("Counting objects:") || line.contains("Compressing objects:") {
         Some(scale_progress(percentage, 25, 29))
@@ -2679,7 +2650,7 @@ fn splash_update_for_dependency_output(
 /// 组装依赖同步阶段的进度更新（总进度 + uv 子进度两段显示）。
 fn dependency_splash_update(
     detail: impl Into<String>,
-    progress: u8,
+    progress: f64,
     uv_progress: &mut UvProgressState,
 ) -> SplashUpdate {
     SplashUpdate::loading(t!("setup.installing_deps"), detail, progress)
@@ -2688,7 +2659,7 @@ fn dependency_splash_update(
 }
 
 /// 把 uv 子进度（0-100）线性映射到总进度条的 64-90 区间。
-fn dependency_global_progress(uv_progress: u8) -> u8 {
+fn dependency_global_progress(uv_progress: f64) -> f64 {
     scale_progress(uv_progress, 64, 90)
 }
 
@@ -2747,25 +2718,32 @@ impl UvProgressState {
 
     /// 估算 uv 阶段的整体进度（0-100，单调递增）。
     ///
-    /// 各阶段锚点：启动后按时间缓慢爬升（0-20）、解析完成 22、
+    /// 各阶段锚点：启动后按时间缓慢爬升（2-20）、解析完成 22、
     /// 下载期取"时间估算"与"包数估算"的较大者（28-88）、准备完成
     /// 92、安装完成 98。进度只会前进，避免输出乱序导致回退。
-    fn progress(&mut self) -> u8 {
+    fn progress(&mut self) -> f64 {
+        self.progress_at(Instant::now())
+    }
+
+    fn progress_at(&mut self, now: Instant) -> f64 {
         let progress = if self.installed {
-            98
+            98.0
         } else if self.prepared {
-            92
+            92.0
         } else if let Some(download_started_at) = self.download_started_at {
             // 双估算取大者：时间估算保证进度不因包信息缺失而停滞，
             // 包数估算让大包下载时进度更贴近真实
-            let elapsed_progress = 28 + (download_started_at.elapsed().as_secs() / 4).min(60) as u8;
-            let package_progress =
-                28 + (self.downloaded_packages.len().min(30) as u8).saturating_mul(2);
-            elapsed_progress.max(package_progress).min(88)
+            let elapsed_progress = 28.0
+                + now
+                    .saturating_duration_since(download_started_at)
+                    .as_secs_f64()
+                    / 4.0;
+            let package_progress = 28.0 + self.downloaded_packages.len().min(30) as f64 * 2.0;
+            elapsed_progress.max(package_progress).min(88.0)
         } else if self.resolved {
-            22
+            22.0
         } else {
-            2 + (self.started_at.elapsed().as_secs() / 10).min(18) as u8
+            (2.0 + now.saturating_duration_since(self.started_at).as_secs_f64() / 10.0).min(20.0)
         };
 
         self.last_progress = self.last_progress.max(progress);
@@ -2889,15 +2867,15 @@ fn format_transfer_speed(bytes_per_second: f64) -> String {
 }
 
 /// 把 0-100 的百分比线性缩放到 `[start, end]` 区间（进度条分段衔接用）。
-fn scale_progress(percentage: u8, start: u8, end: u8) -> u8 {
-    let percentage = percentage.min(100) as u16;
-    let start = start as u16;
-    let end = end as u16;
-    (start + ((percentage * (end - start)) / 100)) as u8
+fn scale_progress(percentage: impl Into<f64>, start: impl Into<f64>, end: impl Into<f64>) -> f64 {
+    let percentage = percentage.into().clamp(0.0, 100.0);
+    let start = start.into();
+    let end = end.into();
+    start + percentage * (end - start) / 100.0
 }
 
-/// 从一行文本中提取最后一个 `N%` 形式的百分比数字；无百分比返回 `None`。
-fn find_percentage(s: &str) -> Option<u8> {
+/// 从一行文本中提取首个 `N%` 形式的百分比数字；保留小数，无百分比返回 `None`。
+fn find_percentage(s: &str) -> Option<f64> {
     s.split('%')
         .next()
         .and_then(|before| {
@@ -2906,9 +2884,10 @@ fn find_percentage(s: &str) -> Option<u8> {
                 .next()
         })
         .and_then(|num| {
-            num.parse::<f32>()
+            num.parse::<f64>()
                 .ok()
-                .map(|v| v.round().clamp(0.0, u8::MAX as f32) as u8)
+                .filter(|value| value.is_finite())
+                .map(|value| value.clamp(0.0, 100.0))
         })
 }
 
@@ -2948,37 +2927,58 @@ mod tests {
 
     #[test]
     fn test_find_percentage() {
-        assert_eq!(Some(8), find_percentage("8%"));
-        assert_eq!(Some(25), find_percentage("loading 25%..."));
-        assert_eq!(Some(100), find_percentage("100%..."));
+        assert_eq!(Some(8.0), find_percentage("8%"));
+        assert_eq!(Some(25.0), find_percentage("loading 25%..."));
+        assert_eq!(Some(25.125), find_percentage("loading 25.125%..."));
+        assert_eq!(Some(100.0), find_percentage("100%..."));
+        assert_eq!(Some(100.0), find_percentage("loading 150%..."));
         assert_eq!(None, find_percentage("%1"));
     }
 
     #[test]
     fn test_git_line_progress_ranges() {
         assert_eq!(
-            Some(25),
+            Some(25.04),
             git_line_progress("remote: Counting objects:   1% (1/66)")
         );
         assert_eq!(
-            Some(40),
+            Some(40.5),
             git_line_progress("Receiving objects:  50% (43546/87092), 179.10 MiB | 5.03 MiB/s")
         );
         assert_eq!(
-            Some(58),
+            Some(58.0),
             git_line_progress("Resolving deltas: 100% (66157/66157), done.")
         );
         assert_eq!(
-            Some(62),
+            Some(62.0),
             git_line_progress("Updating files: 100% (9881/9881), done.")
         );
     }
 
     #[test]
     fn test_git_section_progress_ranges() {
-        assert_eq!(Some(25), git_section_progress("FETCH REPOSITORY BRANCH"));
-        assert_eq!(Some(58), git_section_progress("PULL REPOSITORY BRANCH"));
-        assert_eq!(Some(63), git_section_progress("SHOW VERSION"));
+        assert_eq!(Some(25.0), git_section_progress("FETCH REPOSITORY BRANCH"));
+        assert_eq!(Some(58.0), git_section_progress("PULL REPOSITORY BRANCH"));
+        assert_eq!(Some(63.0), git_section_progress("SHOW VERSION"));
+    }
+
+    #[test]
+    fn test_progress_scaling_preserves_fraction_and_stage_bounds() {
+        assert_eq!(scale_progress(50.0, 64, 90), 77.0);
+        assert_eq!(scale_progress(2.5, 64, 90), 64.65);
+        assert_eq!(scale_progress(150.0, 64, 90), 90.0);
+        assert_eq!(scale_progress(-5.0, 64, 90), 64.0);
+    }
+
+    #[test]
+    fn test_runtime_wait_progress_uses_elapsed_time_over_full_interval() {
+        let update = |elapsed| runtime_wait_update("title", "action", elapsed, 11.0, 13.0);
+        assert_eq!(update(Duration::ZERO).progress, 11.0);
+        assert_eq!(update(Duration::from_secs(60)).progress, 12.0);
+        assert!(update(Duration::from_millis(100)).progress > 11.0);
+        assert!(update(Duration::from_secs(100)).progress < 13.0);
+        assert_eq!(update(Duration::from_secs(120)).progress, 13.0);
+        assert_eq!(update(Duration::from_secs(300)).progress, 13.0);
     }
 
     #[test]
@@ -3054,17 +3054,51 @@ mod tests {
         let downloading =
             splash_update_for_dependency_output("Downloading demo-package (1.5MiB)", &mut progress)
                 .expect("downloading output updates splash");
-        assert_eq!(downloading.uv_progress.expect("uv progress").progress, 28);
+        let downloading_progress = downloading.uv_progress.expect("uv progress").progress;
+        assert!((28.0..=88.0).contains(&downloading_progress));
 
         progress.download_started_at = Some(Instant::now() - Duration::from_secs(1));
         let downloaded =
             splash_update_for_dependency_output("Downloaded demo-package", &mut progress)
                 .expect("downloaded output updates splash");
         assert_eq!(progress.downloaded_bytes, 1_572_864);
-        assert!(downloaded.uv_progress.expect("uv progress").progress < 100);
+        assert!(downloaded.uv_progress.expect("uv progress").progress < 100.0);
 
         progress.observe("Downloaded demo-package");
         assert_eq!(progress.downloaded_bytes, 1_572_864);
+    }
+
+    #[test]
+    fn test_uv_estimated_progress_keeps_subsecond_precision_and_stage_caps() {
+        let mut progress = UvProgressState::new();
+        let now = Instant::now();
+        progress.started_at = now - Duration::from_millis(500);
+        assert_eq!(progress.progress_at(now), 2.05);
+
+        progress.started_at = now - Duration::from_secs(600);
+        assert_eq!(progress.progress_at(now), 20.0);
+
+        progress.download_started_at = Some(now - Duration::from_secs(2));
+        assert_eq!(progress.progress_at(now), 28.5);
+        progress.download_started_at = Some(now - Duration::from_secs(600));
+        assert_eq!(progress.progress_at(now), 88.0);
+
+        progress.observe("Prepared 2 packages in 1s");
+        assert_eq!(progress.progress_at(now), 92.0);
+        progress.observe("Installed 2 packages in 1s");
+        assert_eq!(progress.progress_at(now), 98.0);
+
+        let complete = dependency_complete_update();
+        assert_eq!(complete.progress, 90.0);
+        assert_eq!(complete.uv_progress.expect("uv progress").progress, 100.0);
+    }
+
+    #[test]
+    fn test_dependency_wait_progress_never_goes_back_or_claims_completion() {
+        let mut progress = UvProgressState::new();
+        let waiting = dependency_wait_update(60, 85.0, &mut progress);
+        assert_eq!(waiting.progress, 85.0);
+        assert!(waiting.uv_progress.expect("uv progress").progress < 100.0);
     }
 
     fn assert_proxy_bypass_env(command: &Command) {

@@ -66,6 +66,7 @@ setup:
   uv_waiting_speed: "Collecting download speed data..."
   uv_downloading_detail: "Downloaded %{downloaded}, speed %{speed}/s."
   uv_installing: "Downloads complete. Installing dependencies."
+  uv_completed: "Dependency sync complete."
   rebuilding_env: "Rebuilding runtime environment... | Tips: %{tip}"
   backend_timeout_recovery: "Backend startup timed out. Rebuilding .venv and resyncing dependencies."
   action_wait: "%{action}, please wait."
