@@ -150,6 +150,10 @@ Windows 和 Linux 移除原生窗口装饰（`set_decorations(false)`），通�
 
 `ManagedBackend` 的 `Drop` 实现会扫描所有进程的环境变量，查找包含 `ALAS_LAUNCHER_PID={当前PID}` 的子进程并 kill，防止 `gui.py` 子进程泄漏。
 
+Windows 后端由 `src/backend_process.rs` 创建允许显式脱离的 Job；普通 worker 仍随 Job 回收，
+ALAS 启动模拟器时根据 `ALAS_LAUNCHER_JOB_BREAKAWAY=1` 请求脱离，并清除清理标记和信任密钥。
+两边需配套更新，协议、失败处理与隔离验证见 [后端进程生命周期](docs/backend-lifecycle.md)。
+
 ### 平台相关代码
 
 大量使用 `#[cfg(target_os = "...")]`。`Cargo.toml` 中的平台依赖：

@@ -25,6 +25,9 @@
 mod autostart;
 /// gui.py 后端子进程的托管（启动、就绪探测、终止等）。
 mod backend;
+/// Windows 后端 Job：回收工作进程，同时允许模拟器显式脱离。
+#[cfg(windows)]
+mod backend_process;
 /// 多语言（i18n）初始化与本地化支持。
 mod i18n;
 /// 启动器反向控制流：接收后端经 SSE 下发的退出等指令。

@@ -16,10 +16,13 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use chrono::Local;
-use command_group::{CommandGroup, GroupChild};
+#[cfg(unix)]
+use command_group::{CommandGroup, GroupChild as BackendChild};
 use serde_json::Value as JsonValue;
 use tracing::{info, warn};
 
+#[cfg(windows)]
+use crate::backend_process::BackendChild;
 use crate::setup::{alas_repo_dir, isolate_python_child_environment, venv_python};
 use crate::{launcher_trust_secret, TRUST_SECRET_ENV};
 use crate::window_util::CreateNoWindow as _;
@@ -227,13 +230,14 @@ fn value_as_string_list(value: &JsonValue) -> Vec<String> {
 
 /// 托管中的 gui.py 子进程句柄。
 ///
-/// 持有进程组的 [`GroupChild`]，使终止操作能连同 gui.py 派生的孙进程
+/// 持有后端进程组，使终止操作能连同 gui.py 派生的孙进程
 /// （例如 uvicorn worker）一并结束；子进程的归属另通过 `ALAS_LAUNCHER_PID`
-/// 环境变量在进程表层面标记，供 `Drop` 兜底回收使用。
+/// 环境变量在进程表层面标记，供 `Drop` 兜底回收使用。Windows 模拟器由
+/// ALAS 显式脱离 Job，并清除上述归属标记，从而独立于后端存活。
 pub struct ManagedBackend {
     /// 进程组子进程句柄；`None` 表示已被 [`ManagedBackend::terminate`]
     /// 取走或从未成功拉起，此时 `Drop` 不再重复强杀。
-    child: Option<GroupChild>,
+    child: Option<BackendChild>,
 }
 
 /// `ManagedBackend` 的启动与终止逻辑。
@@ -268,7 +272,10 @@ impl ManagedBackend {
         command.env(TRUST_SECRET_ENV, launcher_trust_secret());
         isolate_python_child_environment(&mut command);
         // 以进程组方式拉起：terminate/drop 时可整组回收，防止孙进程残留。
+        #[cfg(unix)]
         let child = command.group().create_no_window().spawn()?;
+        #[cfg(windows)]
+        let child = BackendChild::spawn(&mut command)?;
         let mut res = Self { child: Some(child) };
 
         // 就绪判定：对 127.0.0.1:{port} 的 TCP 三次握手成功即认为 WebUI 可用。
