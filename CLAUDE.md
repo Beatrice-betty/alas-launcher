@@ -187,6 +187,7 @@ Windows 和 Linux 移除原生窗口装饰（`set_decorations(false)`），通�
 - 测试矩阵：`ubuntu-22.04`、`macos-latest`、`windows-latest`、`windows-11-arm`
 - 安装 Linux Tauri 系统依赖及 stable Rust，按 runner/架构缓存 Cargo 依赖；仅 `main` 保存缓存
 - 执行 `cargo check --locked --all-targets` 和 `cargo test --locked --all-targets`，覆盖启动器和示例目标
+- 额外的 `worker` 任务用临时清单执行 `bash cf-worker/deploy.sh --dry-run`，校验 Cloudflare Worker 配置保持纯静态（无 `main`）
 - 同一事件/分支的新运行取消旧运行；单个矩阵任务失败不取消其他平台，超时为 45 分钟
 - 使用 `build.rs` 的 uv/mTLS 空占位符，不需要发布密钥，也不执行打包或部署
 - Windows 托管 runner 以管理员身份运行，满足启动器 manifest 和 Node.js 安全目录 ACL 的要求；Windows 本地测试也需管理员终端
@@ -199,7 +200,8 @@ GitHub Actions（`.github/workflows/package.yml`）：
 - 下载 Android platform-tools（adb）
 - 创建可重定位 `.venv`（Python 3.14.6 + uv + adb + git + requests）
 - 打包为 `tar.xz` 归档（国际版 + CN 镜像版）
-- 部署启动器自动更新载荷到 `alas.nanoda.work`（通过 SSH）
+- 上传版本化启动器更新载荷到 R2；`stable.json` 作为**纯静态资源**部署到 Cloudflare Worker（`cf-worker/`，主地址 `https://launcher-api.azurpilot.com/updata/stable.json`，无 `main` 脚本，静态请求不消耗 Workers 请求配额；配置与权限见 `cf-worker/README.md`）
+- 旧版更新清单仍由 `deploy-launcher-update-legacy` 通过 SSH 部署到 `alas.nanoda.work`
 
 ### 关键常量与配置
 

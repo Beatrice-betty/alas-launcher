@@ -64,3 +64,26 @@ jobs:
       # the launcher manifest and protected Node.js installer directory tests.
       - name: Run tests
         run: cargo test --locked --all-targets
+
+  worker:
+    name: Validate Cloudflare Worker (static assets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Release builds generate the real manifest; this throwaway one only
+      # validates the Worker config. deploy.sh also rejects any `main` entry.
+      - name: Prepare dummy manifest
+        run: |
+          mkdir -p cf-worker/public/updata
+          printf '%s\n' '{"version":"0.0.0-ci","platforms":{"ci":{"url":"https://example.com","sha256":"0"}}}' > cf-worker/public/updata/stable.json
+
+      - name: Validate static-only Worker config
+        env:
+          WRANGLER_VERSION: "4.151.1"
+        run: bash cf-worker/deploy.sh --dry-run

@@ -1,0 +1,32 @@
+// 启动器更新清单 stable.json 的纯静态托管 Worker。
+//
+// 重要：这里刻意没有 `main` 入口，也没有 run_worker_first / 中间件。
+// stable.json 是一个普通静态资源，命中资源的请求由 Cloudflare 的 assets
+// 层直接返回，不会执行 Worker 脚本，因此不消耗 Workers 请求配额。
+// 不要为了“动态生成 JSON”而添加 fetch 处理器。
+{
+  "$schema": "https://unpkg.com/wrangler@4.151.1/config-schema.json",
+  "name": "launcher-api-static",
+  "compatibility_date": "2026-10-19",
+
+  // 关闭 workers.dev 别名，避免绕过自定义域名上的 mTLS / Access 策略。
+  // 本地调试使用 `wrangler dev` 不受影响；需要临时启用时改为 true。
+  "workers_dev": false,
+
+  "assets": {
+    "directory": "./public",
+    // 纯文件服务，不做 HTML 目录/尾斜杠重写。
+    "html_handling": "none",
+    // 未命中的路径直接返回 public/404.html，不落到 Worker 脚本。
+    "not_found_handling": "404-page"
+  },
+
+  // 新地址由旧地址 302 跳转过来（在旧域名侧配置），Worker 只绑定新域名。
+  // 只接管清单路径，同一域名下的其他路径仍然回源。
+  "routes": [
+    {
+      "pattern": "launcher-api.azurpilot.com/updata/*",
+      "zone_name": "azurpilot.com"
+    }
+  ]
+}

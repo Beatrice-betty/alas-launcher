@@ -16,7 +16,7 @@ const REQUIRE_MTLS_ENV: &str = "REQUIRE_LAUNCHER_MTLS_IDENTITY";
 const LAUNCHER_UPDATE_URL_ENV: &str = "LAUNCHER_UPDATE_URL";
 /// 未显式覆盖时使用的默认自更新源地址。
 const DEFAULT_LAUNCHER_UPDATE_URL: &str =
-    "https://ap-launcher-update.nanoda.work/updata/stable.json";
+    "https://launcher-api.azurpilot.com/updata/stable.json";
 
 /// 执行 Tauri 构建并把编译期资源写入 `OUT_DIR`。
 ///

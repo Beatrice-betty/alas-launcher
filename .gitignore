@@ -12,3 +12,8 @@ AzurLaneAutoScript.app/
 
 # Source font used to generate the tracked launcher subset.
 /fonts/MiSansVF.ttf
+
+# Cloudflare Worker local state and generated deployment manifest.
+/cf-worker/.wrangler/
+/cf-worker/dist/
+/cf-worker/public/updata/stable.json

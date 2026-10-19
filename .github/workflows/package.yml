@@ -169,7 +169,7 @@ jobs:
         env:
           ALAS_LAUNCHER_MTLS_IDENTITY_PEM_B64: ${{ secrets.ALAS_LAUNCHER_MTLS_IDENTITY_PEM_B64 }}
           REQUIRE_LAUNCHER_MTLS_IDENTITY: "1"
-          LAUNCHER_UPDATE_URL: https://ap-launcher-update.nanoda.work/updata/stable.json
+          LAUNCHER_UPDATE_URL: https://launcher-api.azurpilot.com/updata/stable.json
         run: cargo build --locked --release
       - name: Restore bundled Git cache
         id: bundled-git-cache
@@ -649,9 +649,10 @@ jobs:
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
       R2_PREFIX: ${{ secrets.R2_PREFIX }}
       R2_REGION: ${{ secrets.R2_REGION }}
-      NEW_UPDATE_URL: https://ap-launcher-update.nanoda.work/updata/stable.json
+      NEW_UPDATE_URL: https://launcher-api.azurpilot.com/updata/stable.json
       NEW_PAYLOAD_BASE_URL: https://ap-launcher-update-cdn-cn.nanoda.work/updata
-      NEW_MANIFEST_DEPLOY_ROOT: ${{ secrets.NEW_MANIFEST_DEPLOY_ROOT }}
+      # 固定 Wrangler 版本，避免 CI 行为随 latest 漂移。
+      WRANGLER_VERSION: "4.151.1"
     steps:
       - name: Download launcher updater payloads
         uses: actions/download-artifact@v4
@@ -739,25 +740,39 @@ jobs:
               --cache-control "public, max-age=31536000, immutable" \
               --only-show-errors
           done
-      - name: Setup SSH key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
-      - name: Trust deployment host
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -p "${{ secrets.DEPLOY_PORT }}" "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
-      - name: Upload new manifest to OpenResty path
+      # stable.json 以静态资源整体发布到 Worker（cf-worker/ 中没有 main 脚本），
+      # 命中资源的请求不执行 Worker，不消耗 Workers 请求配额。
+      - name: Publish stable.json to Cloudflare Worker
         env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_PATH: ${{ secrets.NEW_MANIFEST_DEPLOY_ROOT }}/updata
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          set -eu
-          REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
-          ssh -p "${DEPLOY_PORT}" "${REMOTE}" "sudo -n mkdir -p '${DEPLOY_PATH}' && sudo -n chown '${DEPLOY_USER}' '${DEPLOY_PATH}'"
-          scp -q -P "${DEPLOY_PORT}" launcher-updater-r2/stable.json "${REMOTE}:${DEPLOY_PATH}/stable.json"
+          set -euo pipefail
+          if [[ -z "${CLOUDFLARE_API_TOKEN:-}" || -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+            echo "::error::缺少 CLOUDFLARE_API_TOKEN 或 CLOUDFLARE_ACCOUNT_ID，无法发布 stable.json" >&2
+            exit 1
+          fi
+          mkdir -p cf-worker/public/updata
+          cp launcher-updater-r2/stable.json cf-worker/public/updata/stable.json
+          bash cf-worker/deploy.sh --message "stable.json ${GITHUB_REF_NAME}"
+      - name: Verify Worker serves stable.json
+        env:
+          MANIFEST_URL: ${{ env.NEW_UPDATE_URL }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 AZURPILOT_LAUNCHER_UPDATE"
+          for attempt in $(seq 1 10); do
+            if curl -fsSL -A "${ua}" --max-time 15 "${MANIFEST_URL}" -o /tmp/stable.json \
+              && python3 -c 'import json,sys; sys.exit(0 if json.load(open("/tmp/stable.json", encoding="utf-8")).get("version") == sys.argv[1] else 1)' "${version}" 2>/dev/null; then
+              echo "Worker is serving stable.json ${version}"
+              exit 0
+            fi
+            echo "stable.json not updated yet (attempt ${attempt}/10), retrying..."
+            sleep 3
+          done
+          echo "::error::Worker did not serve stable.json ${version} within 30 seconds" >&2
+          exit 1
       - name: Delete superseded R2 payload versions
         env:
           VERSION: ${{ github.ref_name }}
