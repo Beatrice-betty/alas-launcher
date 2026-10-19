@@ -263,6 +263,10 @@ jobs:
             curl -L -o adb.zip https://dl.google.com/android/repository/platform-tools-latest-windows.zip
             tar -xvf adb.zip
       - name: Restore managed Python cache
+        # Windows cache restore can leave an invalid minor-version junction
+        # (cpython-3.14-windows-x86_64-none) that `uv python install` cannot
+        # remove; install managed Python fresh on Windows instead.
+        if: runner.os != 'Windows'
         uses: actions/cache@v4
         with:
           key: managed-python-v1-${{ matrix.os }}-${{ runner.arch }}-${{ env.UV_PYTHON }}-uv-${{ env.UV_VERSION }}
@@ -654,6 +658,10 @@ jobs:
       # 固定 Wrangler 版本，避免 CI 行为随 latest 漂移。
       WRANGLER_VERSION: "4.151.1"
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Download launcher updater payloads
         uses: actions/download-artifact@v4
         with:
