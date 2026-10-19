@@ -85,7 +85,7 @@ Token 建议使用 **Edit Cloudflare Workers** 模板，并限制到目标账号
 
 如果不想让 CI 管理路由，可以删除 `wrangler.jsonc` 的 `routes`，改在 Cloudflare 控制台手动绑定 Worker；此时 token 只需 Workers Scripts: Edit。
 
-新版清单的 `NEW_MANIFEST_DEPLOY_ROOT` 与 SSH 上传已移除，可以从仓库 Secrets 中删除该变量；旧版任务（`deploy-launcher-update-legacy`）仍使用 `DEPLOY_*` 系列 secret。
+旧版 SSH 清单任务（`deploy-launcher-update-legacy`）已删除；`NEW_MANIFEST_DEPLOY_ROOT` 和 `DEPLOY_*` 系列 secret 不再被任何 workflow 使用，可以从仓库 Secrets 中删除。
 
 ## 手动发布
 
