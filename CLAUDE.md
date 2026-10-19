@@ -204,7 +204,8 @@ GitHub Actions（`.github/workflows/package.yml`）：
 - 下载 Android platform-tools（adb）
 - 创建可重定位 `.venv`（Python 3.14.6 + uv + adb + git + requests）
 - 打包为 `tar.xz` 归档（国际版 + CN 镜像版）
-- 上传版本化启动器更新载荷到 R2；`stable.json` 作为**纯静态资源**部署到 Cloudflare Worker（`cf-worker/`，主地址 `https://launcher-api.azurpilot.com/updata/stable.json`，无 `main` 脚本，静态请求不消耗 Workers 请求配额；配置与权限见 `cf-worker/README.md`）
+- 上传版本化启动器更新载荷到 R2 和 CNB Release `1.0.0`；`stable.json` 作为**纯静态资源**部署到 Cloudflare Worker（`cf-worker/`，主地址 `https://launcher-api.azurpilot.com/updata/stable.json`，载荷 URL 为 `https://launcher-download.azurpilot.com/<文件名>`，由该域名 302 到 CNB；无 `main` 脚本，静态请求不消耗 Workers 请求配额；配置与权限见 `cf-worker/README.md`）
+- CNB 上传使用 `git-cnb` 1.2.3 和 `CNB_TOKEN` secret；固定 Release `1.0.0`，同名附件先删除再上传以实现覆盖
 - 旧版更新清单仍由 `deploy-launcher-update-legacy` 通过 SSH 部署到 `alas.nanoda.work`
 
 ### 关键常量与配置

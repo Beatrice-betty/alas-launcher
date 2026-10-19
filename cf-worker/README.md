@@ -48,18 +48,34 @@ https://launcher-api.azurpilot.com/updata/stable.json
 
 `package.yml` 的 `deploy-launcher-update` 任务在 tag 构建成功后：
 
-1. 生成 `launcher-updater-r2/stable.json`；
-2. 上传版本化载荷到 R2；
-3. 把清单复制到 `cf-worker/public/updata/stable.json`；
-4. 执行 `bash cf-worker/deploy.sh`，以新版本静态资源整体替换 Worker；
-5. 轮询 `NEW_UPDATE_URL`，确认 Worker 返回的 `version` 与新 tag 一致。
+1. 生成 `launcher-updater-r2/stable.json`，载荷 URL 为 `https://launcher-download.azurpilot.com/<版本化文件名>`；
+2. 上传版本化载荷到 R2（保留作备份）；
+3. 上传同一批载荷到 CNB Release `1.0.0`，同名附件先删除再上传，实现固定覆盖；
+4. 把清单复制到 `cf-worker/public/updata/stable.json`；
+5. 执行 `bash cf-worker/deploy.sh`，以新版本静态资源整体替换 Worker；
+6. 轮询 `NEW_UPDATE_URL`，确认 Worker 返回的 `version` 与新 tag 一致。
 
-需要配置两个 GitHub Secrets：
+需要配置三个 GitHub Secrets：
 
 | Secret | 用途 |
 |---|---|
 | `CLOUDFLARE_API_TOKEN` | Cloudflare API Token |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账号 ID |
+| `CNB_TOKEN` | CNB 访问令牌，用于上传 Release 附件 |
+
+`CNB_TOKEN` 在 <https://cnb.cool/profile/token> 创建。`git-cnb` 官方建议的权限包括 `repo-notes:rw`、`repo-code:rw`、`repo-pr:rw`、`repo-basic-info:r`、`account-profile:r`、`group-manage:rw`；仅上传 Release 附件时至少需要 Release 与仓库信息的读写权限。
+
+CNB Release tag 固定为 `1.0.0`，不要随应用版本变化。清单里的载荷 URL 会经 `launcher-download.azurpilot.com` 302 到：
+
+```
+https://cnb.cool/AzurPilot/AzurPilotLauncher/-/releases/download/1.0.0/<文件名>
+```
+
+例如：
+
+```
+https://launcher-download.azurpilot.com/alas-launcher-windows-aarch64-2.2.5.exe
+```
 
 Token 建议使用 **Edit Cloudflare Workers** 模板，并限制到目标账号与 `azurpilot.com` 区域。至少需要：
 

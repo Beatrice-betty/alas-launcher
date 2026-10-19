@@ -654,7 +654,13 @@ jobs:
       R2_PREFIX: ${{ secrets.R2_PREFIX }}
       R2_REGION: ${{ secrets.R2_REGION }}
       NEW_UPDATE_URL: https://launcher-api.azurpilot.com/updata/stable.json
-      NEW_PAYLOAD_BASE_URL: https://ap-launcher-update-cdn-cn.nanoda.work/updata
+      NEW_PAYLOAD_BASE_URL: https://launcher-download.azurpilot.com
+      # CNB Release 固定使用 1.0.0；每次发布覆盖同名附件，JSON 里的 URL
+      # 指向 launcher-download.azurpilot.com，由该域名 302 到 CNB。
+      CNB_API: https://api.cnb.cool
+      CNB_REPO: AzurPilot/AzurPilotLauncher
+      CNB_RELEASE_TAG: "1.0.0"
+      CNB_CLI_VERSION: "1.2.3"
       # 固定 Wrangler 版本，避免 CI 行为随 latest 漂移。
       WRANGLER_VERSION: "4.151.1"
     steps:
@@ -687,7 +693,7 @@ jobs:
           manifest_url = os.environ["NEW_UPDATE_URL"].rstrip("/")
           if not manifest_url.endswith("/stable.json"):
               raise SystemExit("LAUNCHER_NEW_UPDATE_URL must end with /stable.json")
-          base_url = f'{os.environ["NEW_PAYLOAD_BASE_URL"].rstrip("/")}/{version}'
+          base_url = os.environ["NEW_PAYLOAD_BASE_URL"].rstrip("/")
           source_root = Path("launcher-updater")
           target_root = Path("launcher-updater-r2")
           if target_root.exists():
@@ -747,6 +753,49 @@ jobs:
               --region "${R2_REGION}" \
               --cache-control "public, max-age=31536000, immutable" \
               --only-show-errors
+          done
+      - name: Upload launcher payloads to CNB release
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CNB_TOKEN:-}" ]]; then
+            echo "::error::缺少 CNB_TOKEN，无法上传构建产物到 CNB" >&2
+            exit 1
+          fi
+
+          files=(launcher-updater-r2/alas-launcher-*)
+          if [[ ! -e "${files[0]}" ]]; then
+            echo "::error::launcher-updater-r2 中没有构建产物" >&2
+            exit 1
+          fi
+
+          cli="${RUNNER_TEMP}/git-cnb"
+          curl -fsSL \
+            "https://cnb.cool/looc/git-cnb/-/releases/download/${CNB_CLI_VERSION}/git-cnb_linux_amd64" \
+            -o "${cli}"
+          chmod +x "${cli}"
+
+          auth=(-H "Authorization: token ${CNB_TOKEN}" -H "Accept: application/vnd.cnb.api+json")
+          release_json="$(curl -fsS "${auth[@]}" "${CNB_API}/${CNB_REPO}/-/releases/tags/${CNB_RELEASE_TAG}")"
+          release_id="$(jq -r '.id // empty' <<<"${release_json}")"
+          if [[ -z "${release_id}" ]]; then
+            echo "::error::CNB Release ${CNB_RELEASE_TAG} 不存在或无法读取" >&2
+            exit 1
+          fi
+
+          for file in "${files[@]}"; do
+            [[ -f "${file}" ]] || continue
+            name="$(basename "${file}")"
+            asset_id="$(jq -r --arg name "${name}" '.assets[]? | select(.name == $name) | .id' <<<"${release_json}" | head -n1)"
+            if [[ -n "${asset_id}" && "${asset_id}" != "null" ]]; then
+              echo "Deleting existing CNB asset: ${name} (${asset_id})"
+              curl -fsS -X DELETE "${auth[@]}" \
+                "${CNB_API}/${CNB_REPO}/-/releases/${release_id}/assets/${asset_id}" >/dev/null
+            fi
+            echo "Uploading to CNB: ${name}"
+            "${cli}" --repo="${CNB_REPO}" release asset-upload \
+              -t "${CNB_RELEASE_TAG}" -f "${file}"
           done
       # stable.json 以静态资源整体发布到 Worker（cf-worker/ 中没有 main 脚本），
       # 命中资源的请求不执行 Worker，不消耗 Workers 请求配额。
