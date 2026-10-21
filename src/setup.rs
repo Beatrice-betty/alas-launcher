@@ -4,7 +4,7 @@
 //! - 定位 AzurLaneAutoScript 仓库目录并切换工作目录；
 //! - 通过内嵌/系统 uv 安装 Python 3.14.6、创建可重定位 `.venv`，
 //!   并将 uv / git / adb 一并部署进 `.venv`（`ensure_runtime_tools`）；
-//! - 经 git 拉取最新仓库代码（`git_update`，最多重试 20 次）；
+//! - 经 Python 更新器拉取仓库代码（`git_update`，逐源重试由 Python 限次）；
 //! - 按 `uv.lock` 同步 Python 依赖（`uv_sync_project`）；
 //! - 迁移与校验 `config/deploy.yaml` 部署配置（`migrate_dependency_config`）；
 //! - 清理可重建的运行时状态（`.venv`、缓存）用于故障恢复。
@@ -104,7 +104,7 @@ impl UvProgressState {
     }
 }
 
-/// git 更新的最大重试次数：网络抖动时自动重试，20 次（约 20 秒）已能覆盖常见短暂断网。
+/// 非 Git 阶段的命令重试上限；Git 逐源重试由 Python 更新器负责。
 const MAX_UPDATE_RETRIES: usize = 20;
 /// 每次重试之间的固定间隔。
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -1072,10 +1072,9 @@ fn run_command(
     Ok(())
 }
 
-/// 带重试的命令执行封装：失败后按固定间隔重试至 [`MAX_UPDATE_RETRIES`] 次。
+/// 带重试的命令执行封装；Git 阶段由 Python 管理逐源重试，不重跑整轮更新。
 ///
-/// 每次失败都会向启动画面上报"第 N/20 次重试"状态；取消请求在
-/// 每轮循环开头检查。
+/// 非 Git 阶段的失败会向启动画面上报重试状态；取消请求在每轮循环开头检查。
 ///
 /// # Errors
 /// 用户取消或重试用尽仍失败时返回最后一次的错误。
@@ -1085,7 +1084,12 @@ fn run_command_with_retry(
     phase: ScriptPhase,
     cancel_requested: &AtomicBool,
 ) -> Result<()> {
-    for retry in 0..=MAX_UPDATE_RETRIES {
+    let max_retries = if matches!(phase, ScriptPhase::Git) {
+        0
+    } else {
+        MAX_UPDATE_RETRIES
+    };
+    for retry in 0..=max_retries {
         if cancel_requested.load(Ordering::SeqCst) {
             bail!(t!("setup.cancel_cleaning"));
         }
@@ -1098,7 +1102,7 @@ fn run_command_with_retry(
         ) {
             Ok(()) => return Ok(()),
             Err(err) => {
-                if retry == MAX_UPDATE_RETRIES {
+                if retry == max_retries {
                     return Err(err);
                 }
 
@@ -1222,15 +1226,26 @@ fn dependency_wait_update(
 /// 不直接调用 git，而是复用上游 ALAS 的 Python 更新逻辑，保证更新
 /// 行为（远程配置、冲突处理）与官方安装器一致；脚本会给 `execute`
 /// 打补丁，为 fetch 命令强制加上 `--progress` 以便解析进度条。
-/// 失败时由 [`run_command_with_retry`] 自动重试（最多 20 次）。
+/// 网络重试和换源由 Python 更新器限次处理，失败后立即返回，保留代理环境。
 ///
 /// # Errors
-/// 用户取消或重试用尽仍失败时返回 Err。
+/// 用户取消或 Python 更新器耗尽候选源时返回 Err。
 fn git_update(
     status_updater: impl FnMut(SplashUpdate),
     bootstrap_uv: &Path,
     cancel_requested: &AtomicBool,
 ) -> Result<()> {
+    let python = venv_python();
+    run_command_with_retry(
+        || git_update_command(&python, bootstrap_uv),
+        status_updater,
+        ScriptPhase::Git,
+        cancel_requested,
+    )
+}
+
+/// 构造 Git 更新子进程，隔离 Python 路径并继承用户代理。
+fn git_update_command(python: &Path, bootstrap_uv: &Path) -> Command {
     // Decorate execute() to get fetch progress
     let script = r#"
 import deploy.git
@@ -1244,21 +1259,11 @@ gm = deploy.git.GitManager()
 gm.execute = decorate_execute(gm.execute)
 gm.git_install()
 "#;
-    let python = venv_python();
-    let bootstrap_uv = bootstrap_uv.to_path_buf();
-    run_command_with_retry(
-        || {
-            let mut cmd = Command::new(&python);
-            cmd.args(["-u", "-c", script])
-                .env("AZURPILOT_BOOTSTRAP_UV", &bootstrap_uv);
-            isolate_python_child_environment(&mut cmd);
-            bypass_proxy_for_child(&mut cmd);
-            cmd
-        },
-        status_updater,
-        ScriptPhase::Git,
-        cancel_requested,
-    )
+    let mut cmd = Command::new(python);
+    cmd.args(["-u", "-c", script])
+        .env("AZURPILOT_BOOTSTRAP_UV", bootstrap_uv);
+    isolate_python_child_environment(&mut cmd);
+    cmd
 }
 
 /// 按 `uv.lock` 同步 Python 依赖，带 PyPI 镜像源的多级回退。
@@ -2895,6 +2900,78 @@ fn find_percentage(s: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_update_failure_does_not_restart_python() {
+        let temp = tempfile::tempdir().expect("创建临时目录");
+        let cancel_requested = AtomicBool::new(false);
+        let result = run_command_with_retry(
+            || {
+                #[cfg(windows)]
+                let mut cmd = {
+                    let mut cmd = Command::new("cmd");
+                    cmd.args([
+                        "/D",
+                        "/C",
+                        "echo attempt>>attempts.txt & echo sources exhausted 1>&2 & exit /b 1",
+                    ]);
+                    cmd
+                };
+                #[cfg(not(windows))]
+                let mut cmd = {
+                    let mut cmd = Command::new("sh");
+                    cmd.args([
+                        "-c",
+                        "echo attempt >> attempts.txt; echo sources exhausted >&2; exit 1",
+                    ]);
+                    cmd
+                };
+                cmd.current_dir(temp.path());
+                cmd
+            },
+            |_| {},
+            ScriptPhase::Git,
+            &cancel_requested,
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string().trim(), "sources exhausted");
+        let attempts = fs::read_to_string(temp.path().join("attempts.txt")).expect("读取执行次数");
+        assert_eq!(attempts.lines().count(), 1);
+    }
+
+    #[test]
+    fn git_update_cancellation_does_not_spawn_command() {
+        let cancel_requested = AtomicBool::new(true);
+        let result = run_command_with_retry(
+            || panic!("已取消的更新不应启动子进程"),
+            |_| {},
+            ScriptPhase::Git,
+            &cancel_requested,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn git_update_command_preserves_proxy_environment() {
+        let command = git_update_command(Path::new("python"), Path::new("uv"));
+        for proxy in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ] {
+            assert!(
+                !command.get_envs().any(|(key, _)| key == proxy),
+                "应继承 {proxy}"
+            );
+        }
+        assert_python_environment_isolated(&command);
+        assert_eq!(command.get_program(), "python");
+    }
 
     #[test]
     fn backend_timeout_recovery_removes_only_venv() {

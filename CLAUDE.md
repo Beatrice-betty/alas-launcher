@@ -113,7 +113,7 @@ locales/
 2. 创建 Tauri 应用：显示 splash 窗口（`alas-splash://` 自定义协议），隐藏 main 窗口
 3. 后台线程执行 `setup_alas_repo()`：
    - `ensure_runtime_tools()`：下载 Python 3.14.6（通过 uv managed python）、创建可重定位 `.venv`、复制 uv/adb/git 到 `.venv`；检测到 `.venv` 的 Python 低于 3.14.5 时会删除并重建整个环境
-   - `git_update()`：通过 Python 脚本调用 `deploy.git.GitManager` 拉取最新代码（带重试，最多 20 次）
+   - `git_update()`：通过 Python 脚本调用 `deploy.git.GitManager` 拉取最新代码；逐源重试交给 Python 更新器，启动器只执行一次，保留用户代理环境
    - `uv_sync_project()`：执行 `uv sync --frozen --no-dev --no-install-project` 安装依赖
 4. `ManagedBackend::new()` 启动 `gui.py`，设置 `ALAS_LAUNCHER_PID` 环境变量，等待端口就绪（60 秒超时）
 5. 启动 SSE 通知流（`/api/notify_stream`），销毁 splash 窗口，显示 main 窗口
@@ -211,7 +211,7 @@ GitHub Actions（`.github/workflows/package.yml`）：
 
 - 默认 WebUI 端口：`22267`
 - Python 版本：`3.14.6`（`setup.rs` 中 `PYTHON_VERSION`）
-- Git 更新最大重试：20 次，间隔 1 秒
+- Git 更新只启动一次 Python；逐源超时、重试和 GitCode → GitHub 换源由 ALAS 的 `GitManager` 管理，全部失败后立即报错
 - 后端端口等待超时：60 秒
 - 后端连接检查超时：500 毫秒
 - 通知流断线重连间隔：3 秒
