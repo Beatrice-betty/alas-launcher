@@ -263,7 +263,13 @@ impl ManagedBackend {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Self> {
         crate::launcher::ensure_not_cancelled(cancel)?;
-        kill_processes_using_port(config.port)?;
+        if cfg!(feature = "independent") {
+            if std::net::TcpStream::connect(("127.0.0.1", config.port)).is_ok() {
+                anyhow::bail!("端口 {} 已被占用，请在部署配置中改用空闲端口", config.port);
+            }
+        } else {
+            kill_processes_using_port(config.port)?;
+        }
 
         // 使用仓库 venv 内的 Python 解释器，避免依赖系统全局 Python 环境。
         let mut command = Command::new(venv_python());
@@ -274,6 +280,9 @@ impl ManagedBackend {
         command
             .env_remove("AZURPILOT_PREBUILT")
             .env("AZURPILOT_NO_UV_BOOTSTRAP", "1");
+        if cfg!(feature = "independent") {
+            command.env("AZURPILOT_INDEPENDENT", "1");
+        }
         // 以进程组方式拉起：terminate/drop 时可整组回收，防止孙进程残留。
         #[cfg(unix)]
         let child = command.group().create_no_window().spawn()?;

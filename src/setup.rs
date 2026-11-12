@@ -292,6 +292,9 @@ fn venv_bin_dir() -> PathBuf {
 
 /// `.venv` 内 Python 解释器的完整路径。
 pub fn venv_python() -> PathBuf {
+    if cfg!(feature = "independent") {
+        return azurpilot_repo_dir().join("runtime/python/python.exe");
+    }
     venv_bin_dir().join(if cfg!(windows) {
         "python.exe"
     } else {
@@ -417,6 +420,14 @@ pub fn setup_environment() -> Result<()> {
     info!("AzurPilot dir is {:?}", &dir);
     fs::create_dir_all(&dir)?;
     set_current_dir(&dir)?;
+    if cfg!(feature = "independent") {
+        let webview = dir.join("runtime/webview2");
+        if !webview.join("msedgewebview2.exe").is_file() {
+            bail!("安装包内的 WebView2 缺失，请用完整安装包修复");
+        }
+        std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", webview);
+        return Ok(());
+    }
     prepend_path_to_env("PATH", venv_bin_dir());
     if cfg!(windows) {
         // Windows MinGit 布局的 git.exe 藏在 git/cmd 下，需单独加入 PATH
@@ -498,6 +509,32 @@ pub fn setup_azurpilot_repo(
     skip_repository_update: bool,
     sources: &Preferences,
 ) -> Result<()> {
+    if cfg!(feature = "independent") {
+        let root = azurpilot_repo_dir();
+        let python = venv_python();
+        let recovery = root.join("runtime/independent_update.py");
+        if !python.is_file() || !recovery.is_file() {
+            bail!("安装包缺少本地运行环境，请用完整安装包修复");
+        }
+        let result = Command::new(python)
+            .args(["-B", "runtime/independent_update.py", "recover"])
+            .env("PYTHONNOUSERSITE", "1")
+            .env_remove("PYTHONHOME")
+            .env_remove("PYTHONPATH")
+            .current_dir(&root)
+            .create_no_window()
+            .output()?;
+        if !result.status.success() {
+            bail!("无法恢复上次更新：{}", String::from_utf8_lossy(&result.stderr));
+        }
+        for path in ["gui.py", "frontend/dist/index.html", ".azurpilot/independent.json",
+                     "runtime/adb/adb.exe", "runtime/git/cmd/git.exe"] {
+            if !root.join(path).is_file() {
+                bail!("安装包缺少 {path}，请用完整安装包修复");
+            }
+        }
+        return Ok(());
+    }
     info!("Starting setup for AzurPilot repository...");
     status_updater(
         SplashUpdate::loading(

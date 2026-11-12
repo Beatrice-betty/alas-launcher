@@ -9,12 +9,14 @@ use crate::{
     preview_crash_arg_present, preview_no_update_arg_present,
     progress::{self, SplashUpdate},
     setup::{self, get_deploy_config, setup_azurpilot_repo, setup_environment},
-    start_minimized_arg_present, time_bomb_expiration_message, updater,
+    start_minimized_arg_present, updater,
     windows::*,
 };
 // window_util 仅在 Windows 控制台探测中使用；拆出按平台导入避免 Linux 告警。
 #[cfg(windows)]
 use crate::window_util;
+#[cfg(not(feature = "independent"))]
+use crate::time_bomb_expiration_message;
 use anyhow::{bail, Context, Result};
 use rust_i18n::t;
 use serde::Serialize;
@@ -108,9 +110,9 @@ impl Model {
                 phase: Phase::Idle,
                 operation: None,
                 update_version: None,
-                update_checked: false,
+                update_checked: cfg!(feature = "independent"),
                 backend_running: false,
-                deployment_required: true,
+                deployment_required: !cfg!(feature = "independent"),
                 progress: None,
                 error: None,
                 error_code: None,
@@ -140,9 +142,9 @@ impl Model {
         let ready = free && view.update_checked && self.update.is_none() && !view.backend_running;
         view.can_start = ready && !view.deployment_required;
         view.can_deploy = ready && view.deployment_required;
-        view.can_repair = ready;
+        view.can_repair = ready && !cfg!(feature = "independent");
         view.can_stop = free && view.backend_running;
-        view.can_check = free && !view.backend_running;
+        view.can_check = free && !view.backend_running && !cfg!(feature = "independent");
         view.can_update = free && self.update.is_some();
         view.can_cancel = self.active && !self.committing && !self.exiting;
         view
@@ -385,7 +387,7 @@ impl Launcher {
             let result = (|| {
                 let deployment_required =
                     crate::components::deployment_required(&setup::azurpilot_repo_dir());
-                let update = if controller.skip_update {
+                let update = if cfg!(feature = "independent") || controller.skip_update {
                     None
                 } else {
                     let channel = controller
@@ -439,12 +441,18 @@ impl Launcher {
 
     /// 供设置切换与定期轮询触发的静默检查：任务互斥时跳过本轮。
     pub(crate) fn request_update_check(self: &Arc<Self>) {
+        if cfg!(feature = "independent") {
+            return;
+        }
         if let Err(error) = self.check(false) {
             debug!("Skipped periodic update check: {error:#}");
         }
     }
 
     fn install_update(self: &Arc<Self>) -> Result<()> {
+        if cfg!(feature = "independent") {
+            bail!("请在 ALAS 控制台中更新程序。启动器通过完整安装包更新。");
+        }
         let (task, cancel) = self.begin(Operation::Update)?;
         let controller = self.clone();
         thread::spawn(move || {
@@ -488,6 +496,9 @@ impl Launcher {
     }
 
     fn deploy(self: &Arc<Self>) -> Result<()> {
+        if cfg!(feature = "independent") {
+            bail!("请使用完整离线安装包部署");
+        }
         let (task, cancel) = self.begin(Operation::Deploy)?;
         let controller = self.clone();
         thread::spawn(move || {
@@ -578,6 +589,9 @@ impl Launcher {
     }
 
     fn repair(self: &Arc<Self>) -> Result<()> {
+        if cfg!(feature = "independent") {
+            bail!("请使用同版本完整安装包修复运行环境");
+        }
         let (task, cancel) = self.begin(Operation::Repair)?;
         let controller = self.clone();
         thread::spawn(move || {
@@ -1060,13 +1074,14 @@ pub(crate) fn run() -> Result<()> {
                 recreate: Arc::new(AtomicBool::new(false)), notified_update: Mutex::new(None), port, skip_update: preview_crash || preview_deploy || preview_no_update_arg_present(), minimized });
             app.manage(controller.clone());
             app.manage(settings_store.clone());
-            let auto_start = auto_start || settings_store.auto_start_service();
+            let auto_start = cfg!(feature = "independent") || auto_start || settings_store.auto_start_service();
             // 启动时恢复“阻止计算机自动睡眠”电源锁；失败仅记录，不阻塞启动。
             if settings_store.get().prevent_sleep {
                 if let Err(error) = crate::power::set_prevent_sleep(true) {
                     warn!("Failed to restore prevent-sleep lock: {error:#}");
                 }
             }
+            #[cfg(not(feature = "independent"))]
             match time_bomb_expiration_message() {
                 Ok(Some(message)) => {
                     allow_for_setup.store(true, Ordering::SeqCst);
@@ -1108,7 +1123,11 @@ pub(crate) fn run() -> Result<()> {
                 controller.change(|model| { model.view.update_checked = true; model.view.deployment_required = true; model.touch(); });
                 if let Some(window) = app.get_webview_window("launcher") { window.set_title("AzurPilot Debug")?; }
                 show_launcher_home(app.handle())?;
-            } else { controller.check(auto_start)?; }
+            } else if cfg!(feature = "independent") {
+                controller.start()?;
+            } else {
+                controller.check(auto_start)?;
+            }
             let ctrl_controller = controller.clone();
             ctrlc::set_handler(move || { let _ = ctrl_controller.exit(); })?;
             Ok(())
@@ -1297,6 +1316,15 @@ mod tests {
             ));
         }
     }
+    #[cfg(feature = "independent")]
+    #[test]
+    fn independent_model_starts_without_launcher_update_check() {
+        let mut model = Model::new();
+        assert!(model.snapshot().can_start);
+        assert!(!model.snapshot().can_check);
+        assert!(model.begin(Operation::Start).is_ok());
+    }
+
     fn ready() -> Model {
         let mut m = Model::new();
         m.view.update_checked = true;

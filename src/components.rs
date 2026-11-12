@@ -137,6 +137,9 @@ fn intact(root: &Path, installed: &InstalledComponent) -> bool {
 
 /// 部署是否必需：引导物（git/adb 组件与 deploy 脚本）缺失或未完成时为真。
 pub(crate) fn deployment_required(root: &Path) -> bool {
+    if cfg!(feature = "independent") {
+        return false;
+    }
     if root.join(TRANSACTION).join("journal.json").exists() {
         return true;
     }

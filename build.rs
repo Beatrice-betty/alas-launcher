@@ -33,8 +33,8 @@ fn main() {
     // 内嵌 manifest：requireAdministrator 保证启动器始终以管理员运行，
     // 以便执行需要提权的安装与修复操作；Common-Controls 6 启用现代视觉
     // 样式，确保原生控件外观一致。
-    let windows = tauri_build::WindowsAttributes::new().app_manifest(
-        r#"
+    let independent = env::var_os("CARGO_FEATURE_INDEPENDENT").is_some();
+    let manifest = r#"
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <dependency>
     <dependentAssembly>
@@ -56,10 +56,23 @@ fn main() {
     </security>
   </trustInfo>
 </assembly>
-"#,
-    );
+"#;
+    let manifest = if independent {
+        manifest.replace("requireAdministrator", "asInvoker")
+    } else {
+        manifest.to_owned()
+    };
+    let windows = tauri_build::WindowsAttributes::new().app_manifest(manifest);
     let attrs = tauri_build::Attributes::new().windows_attributes(windows);
     tauri_build::try_build(attrs).expect("failed to run tauri build script");
+
+    if independent {
+        let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+        fs::write(out_dir.join("bootstrap_uv.bin"), []).expect("write empty uv placeholder");
+        fs::write(out_dir.join("launcher_mtls_identity.pem"), []).expect("write empty identity placeholder");
+        println!("cargo:rustc-env=LAUNCHER_UPDATE_URL=");
+        return;
+    }
 
     // 图标目录与相关环境变量发生变化时，必须重新执行构建脚本。
     println!("cargo:rerun-if-changed=icons/");
