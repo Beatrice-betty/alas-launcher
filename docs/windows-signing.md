@@ -16,6 +16,8 @@ GitHub Actions 需要以下配置：
 
 本地生成的 AzurPilot 自签名证书位于用户目录 `.azurpilot/code-signing/`，包含加密的 `AzurPilot-CodeSigning.pfx`、公开的 `AzurPilot-CodeSigning.cer` 和单独保存的 `password.txt`；目录仅当前用户与 SYSTEM 有访问权限。这些文件不属于仓库，私钥和密码不能提交或放入构建产物。请备份此目录，后续版本复用同一证书。
 
+独立版在本机构建时也复用签名脚本，调用方法见 [Windows 独立版打包说明](independent-windows.md)。独立版的本机证书使用 `password.dpapi`，由生成证书的 Windows 账户在同一台机器上解密。
+
 自签名仅证明文件由持有同一私钥的人签署并可检测篡改，不能建立公开可信的发布者身份。Windows 仍可能显示未知发布者、SmartScreen 或杀毒软件提示。需要公开信任时，应替换为可信代码签名证书或接入已验证的云签名服务；现有更新通道的 mTLS 证书不能用于替代代码签名。
 
 参考：[Microsoft SignTool](https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool)、[Microsoft 代码签名说明](https://learn.microsoft.com/en-us/windows/apps/develop/smart-app-control/code-signing-for-smart-app-control)、[Inno Setup 签名配置](https://jrsoftware.org/ishelp/topic_setup_signtool.htm)。

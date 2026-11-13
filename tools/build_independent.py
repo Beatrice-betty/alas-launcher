@@ -12,10 +12,14 @@ import time
 import zipfile
 from pathlib import Path
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+NODE_DIRECTORY = 'node-v24.22.2-win-x64'
+NODE_SHA256 = 'ca1bff5d8ead13c9f2ea404a176db46bd430704d5b5113734049fa365e7799e2'
 
 
 def make_key(path):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     if not path.is_file():
         path.parent.mkdir(parents=True, exist_ok=True)
         key = Ed25519PrivateKey.generate()
@@ -54,6 +58,13 @@ def copytree(source, destination):
     shutil.copytree(source, destination, dirs_exist_ok=True, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
 
 
+def check_launcher_paths(launcher):
+    payload = launcher.read_bytes()
+    private_path = re.compile(rb'(?i)[A-Z]:[/\\](?:Users[/\\](?!Public[/\\])|[^\x00\r\n]{1,512}[/\\]azurpilot\.pdb)')
+    if any(private_path.search(data) for data in (payload, payload[::2], payload[1::2])):
+        raise ValueError('启动器含本机用户目录或调试文件路径，请按独立版说明重新编译')
+
+
 def assemble(alas, release, key_path, *, package=None, inputs=None, python_root=None, launcher=None):
     sys.path.insert(0, str(alas))
     from deploy import independent
@@ -67,6 +78,11 @@ def assemble(alas, release, key_path, *, package=None, inputs=None, python_root=
         raise FileNotFoundError(dist / 'index.html')
     if 'clarity.ms' in (dist / 'index.html').read_text(encoding='utf-8'):
         raise ValueError('构建的 WebUI 仍含 Clarity')
+    if package is not None:
+        check_launcher_paths(launcher)
+        node_zip = inputs / (NODE_DIRECTORY + '.zip')
+        if independent.digest(node_zip) != NODE_SHA256:
+            raise ValueError('Node.js 官方发行包 SHA-256 不匹配')
     key = make_key(key_path)
     release.mkdir(parents=True, exist_ok=False)
     frontend = release / 'frontend.zip'
@@ -107,13 +123,17 @@ def assemble(alas, release, key_path, *, package=None, inputs=None, python_root=
         copytree(inputs / 'mingit', runtime / 'git')
         copytree(inputs / 'adb/platform-tools', runtime / 'adb')
         copytree(inputs / 'atx', runtime / 'atx')
+        with zipfile.ZipFile(node_zip) as bundle:
+            node_temp = temporary / 'node'
+            bundle.extractall(node_temp)
+            shutil.move(node_temp / NODE_DIRECTORY, runtime / 'nodejs')
         webview_exe, = (inputs / 'webview2').glob('*/msedgewebview2.exe')
         copytree(webview_exe.parent, runtime / 'webview2')
         shutil.copy2(root / 'deploy/independent.py', runtime / 'independent_update.py')
         shutil.copy2(launcher, root / 'AzurPilot.exe')
         shutil.copy2(Path(__file__).resolve().parents[1] / 'LICENSE', root / 'launcher-LICENSE.txt')
         independent.write_json(runtime / 'components.json', {
-            'python': subprocess.check_output([str(runtime / 'python/python.exe'), '--version'], text=True).strip(),
+            'python': subprocess.check_output([str(runtime / 'python/python.exe'), '-B', '--version'], text=True).strip(),
             'git': subprocess.check_output([str(runtime / 'git/cmd/git.exe'), '--version'], text=True).strip(),
             'webview2': webview_exe.parent.name,
             'adb': subprocess.check_output([str(runtime / 'adb/adb.exe'), 'version'], text=True).splitlines()[1],
