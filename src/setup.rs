@@ -512,25 +512,68 @@ pub fn setup_azurpilot_repo(
     if cfg!(feature = "independent") {
         let root = azurpilot_repo_dir();
         let python = venv_python();
-        let recovery = root.join("runtime/independent_update.py");
-        if !python.is_file() || !recovery.is_file() {
+        let recovery_script = "runtime/independent_update.py";
+        if !python.is_file() || !root.join(recovery_script).is_file() {
             bail!("安装包缺少本地运行环境，请用完整安装包修复");
         }
-        let result = Command::new(python)
-            .args(["-B", "runtime/independent_update.py", "recover"])
-            .env("PYTHONNOUSERSITE", "1")
-            .env_remove("PYTHONHOME")
-            .env_remove("PYTHONPATH")
-            .current_dir(&root)
-            .create_no_window()
-            .output()?;
-        if !result.status.success() {
-            bail!("无法恢复上次更新：{}", String::from_utf8_lossy(&result.stderr));
-        }
+        let recover = || -> Result<()> {
+            let result = Command::new(&python)
+                .args(["-B", recovery_script, "recover"])
+                .env("PYTHONNOUSERSITE", "1")
+                .env_remove("PYTHONHOME")
+                .env_remove("PYTHONPATH")
+                .current_dir(&root)
+                .create_no_window()
+                .output()?;
+            if !result.status.success() {
+                bail!("无法恢复上次更新：{}", String::from_utf8_lossy(&result.stderr));
+            }
+            Ok(())
+        };
+        recover()?;
         for path in ["gui.py", "frontend/dist/index.html", ".azurpilot/independent.json",
                      "runtime/adb/adb.exe", "runtime/git/cmd/git.exe"] {
             if !root.join(path).is_file() {
                 bail!("安装包缺少 {path}，请用完整安装包修复");
+            }
+        }
+        // The WebUI supervisor confirms the candidate after the console is ready.
+        let supervised = get_deploy_config()
+            .and_then(|config| {
+                config.pointer("/Deploy/Update/EnableReload").and_then(JsonValue::as_bool)
+            })
+            .unwrap_or(true);
+        if !skip_repository_update && supervised {
+            status_updater(SplashUpdate::loading(
+                t!("setup.updating"),
+                t!("setup.fetching_patches"),
+                41,
+            ));
+            let mut update = Command::new(&python);
+            update
+                .args([
+                    "-B",
+                    "-c",
+                    concat!(
+                        "from deploy import independent\n",
+                        "offer = independent.check()\n",
+                        "if offer is not None:\n",
+                        "    ready = independent.prepare(offer)\n",
+                        "    independent.apply(ready)\n",
+                        "    print(f'ALAS 更新已就绪：{offer[0][\"revision\"]}')\n",
+                    ),
+                ])
+                .current_dir(&root)
+                .env("PYTHONNOUSERSITE", "1")
+                .env("PYTHONUTF8", "1");
+            isolate_python_child_environment(&mut update);
+            if let Err(error) =
+                run_command(&mut update, status_updater, ScriptPhase::Git, &cancel_requested)
+            {
+                // A cancelled updater may have been replacing files when it stopped.
+                recover()?;
+                crate::launcher::ensure_not_cancelled(&cancel_requested)?;
+                warn!("Independent startup update skipped: {error:#}");
             }
         }
         return Ok(());
