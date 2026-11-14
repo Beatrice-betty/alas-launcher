@@ -21,6 +21,8 @@ splash:
   startup_complete: "啟動完成！"
 
 setup:
+  bootstrap_required: "缺少部署檔案。請將最新簡裝包安裝到目前資料夾，再開啟啟動器重試。"
+  webview_required: "無法準備 Microsoft WebView2。請安裝微軟 WebView2 Runtime，再重新開啟 AzurPilot。"
   preparing_workspace: "準備工作區"
   cleaning_cache: "正在清理快取並檢查本機環境。"
   checking_env: "檢查本機環境中... | Tips：%{tip}"
@@ -338,7 +340,7 @@ launcher:
   export_gui_log: "匯出 WebUI 日誌"
   details: "檢視錯誤詳情"
   repair_title: "重建執行環境？"
-  repair_body: "重新下載並替換 Git、ADB、deploy 腳本及系統範本，重建 Python 與依賴。保留其他程式碼、使用者設定、日誌與下載快取。完成後請手動啟動。"
+  repair_body: "重新下載 Git、ADB 等執行元件，重建 Python 與依賴，並補齊缺少的程式檔案。保留使用者設定、日誌與下載快取。完成後請手動啟動。"
   repair_confirm: "開始修復"
   cancel: "取消"
   click_cancel_hint: "點擊取消"

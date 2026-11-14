@@ -21,6 +21,8 @@ splash:
   startup_complete: "起動完了！"
 
 setup:
+  bootstrap_required: "デプロイ用のファイルが見つかりません。最新の軽量インストーラーでこのフォルダーにインストールし、AzurPilot を開き直してください。"
+  webview_required: "Microsoft WebView2 を準備できませんでした。Microsoft WebView2 Runtime をインストールし、AzurPilot を開き直してください。"
   preparing_workspace: "ワークスペースを準備中"
   cleaning_cache: "キャッシュをクリーンアップし、ローカル環境を確認中です。"
   checking_env: "ローカル環境を確認中... | Tips：%{tip}"
@@ -338,7 +340,7 @@ launcher:
   export_gui_log: "WebUI ログを保存"
   details: "エラーの詳細"
   repair_title: "実行環境を再構築しますか？"
-  repair_body: "Git・ADB・deploy スクリプト・システム用テンプレートを再ダウンロードして置き換え、Python と依存関係を再構築します。その他のコード、ユーザー設定、ログ、ダウンロードキャッシュは保持されます。完了後は手動で起動してください。"
+  repair_body: "Git・ADB などを再ダウンロードし、Python と依存関係を再構築して、不足しているプログラムファイルを復元します。ユーザー設定、ログ、ダウンロードキャッシュは保持されます。完了後は手動で起動してください。"
   repair_confirm: "修復を開始"
   cancel: "キャンセル"
   click_cancel_hint: "クリックでキャンセル"

@@ -347,8 +347,13 @@ fn main() -> Result<()> {
 fn initialize_logging() -> Result<WorkerGuard> {
     let log_dir = Path::new("log");
     let log_filename = today_launcher_log_filename();
-    truncate_log_file(log_dir, &log_filename)?;
-    // rolling::never 不做按时间/大小轮转，固定写当日文件（启动时已先截断）。
+    if cfg!(feature = "independent") {
+        // Keep earlier deployment errors available after a restart on the same day.
+        fs::create_dir_all(log_dir)?;
+    } else {
+        truncate_log_file(log_dir, &log_filename)?;
+    }
+    // rolling::never 不做按时间或大小轮转，固定写入启动日的文件。
     let file_appender = tracing_appender::rolling::never(log_dir, log_filename);
     let (non_blocking_file, guard) = tracing_appender::non_blocking(file_appender);
 

@@ -135,11 +135,45 @@ fn intact(root: &Path, installed: &InstalledComponent) -> bool {
         })
 }
 
-/// 部署是否必需：引导物（git/adb 组件与 deploy 脚本）缺失或未完成时为真。
+/// 部署是否必需。独立版检查本地运行环境，普通版检查部署引导物。
 pub(crate) fn deployment_required(root: &Path) -> bool {
     if cfg!(feature = "independent") {
-        return false;
+        independent_deployment_required(root)
+    } else {
+        managed_deployment_required(root)
     }
+}
+
+fn independent_deployment_required(root: &Path) -> bool {
+    if root.join(TRANSACTION).join("journal.json").is_file() {
+        return true;
+    }
+    if root.join(".azurpilot/independent-update/transaction.json").is_file() {
+        // The existing ALAS rollback can restore files before readiness is checked again.
+        return !root.join("runtime/python/python.exe").is_file();
+    }
+    !independent_runtime_ready(root)
+        || ![
+            ".azurpilot/independent.json",
+            ".azurpilot/independent-files.json",
+            "gui.py",
+            "frontend/dist/index.html",
+        ]
+        .iter()
+        .all(|path| root.join(path).is_file())
+}
+
+pub(crate) fn independent_runtime_ready(root: &Path) -> bool {
+    [
+        "runtime/independent_update.py",
+        "runtime/python/python.exe",
+        "runtime/git/cmd/git.exe",
+        "runtime/adb/adb.exe",
+        "runtime/nodejs/node.exe",
+    ].iter().all(|path| root.join(path).is_file())
+}
+
+fn managed_deployment_required(root: &Path) -> bool {
     if root.join(TRANSACTION).join("journal.json").exists() {
         return true;
     }
@@ -458,7 +492,7 @@ fn install(
             Ok(manifest) => manifest,
             Err(error) => {
                 ensure_not_cancelled(&cancel)?;
-                if !repair && !deployment_required(root) {
+                if !repair && !managed_deployment_required(root) {
                     warn!("Using complete installed runtime offline: {error:#}");
                     return Ok(());
                 }
@@ -1006,11 +1040,138 @@ fn recover(root: &Path) -> Result<()> {
     clean_transaction(root)
 }
 
+pub(crate) fn deploy_independent(
+    root: &Path,
+    provision: impl FnOnce(&Path, &mut dyn FnMut(SplashUpdate)) -> Result<()>,
+    progress: &mut dyn FnMut(SplashUpdate),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    recover(root)?;
+    let transaction = secure_target(root, TRANSACTION)?;
+    let stage = transaction.join("new");
+    fs::create_dir_all(&stage)?;
+    provision(&stage, progress)?;
+    ensure_not_cancelled(cancel)?;
+    if !independent_runtime_ready(&stage) {
+        bail!(t!("launcher.deploy_failed"));
+    }
+    if !root.join(".azurpilot/independent.json").is_file() && independent_deployment_required(&stage) {
+        bail!(t!("launcher.deploy_failed"));
+    }
+
+    let mut changed = BTreeSet::new();
+    let mut directories = vec![stage.clone()];
+    let runtime = root.join("runtime");
+    if runtime.is_dir() {
+        // Replace managed runtime files and drop stale package contents on repair.
+        // Leave an installed fixed WebView2 available for the live launcher window.
+        for id in ["python", "git", "adb", "nodejs", "atx"] {
+            let old = secure_target(root, &format!("runtime/{id}"))?;
+            if old.is_dir() {
+                directories.push(old);
+            }
+        }
+    }
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            ensure_not_cancelled(cancel)?;
+            let path = entry?.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if crate::fs_util::is_symlink_or_reparse_point(&metadata) {
+                bail!("Unexpected link in staged installation: {}", path.display());
+            }
+            if metadata.is_dir() {
+                directories.push(path);
+            } else {
+                let prefix = if path.starts_with(&stage) { &stage } else { root };
+                let name = path.strip_prefix(prefix)?.to_string_lossy().replace('\\', "/");
+                let allowed = [
+                    "assets/", "bin/", "campaign/", "deploy/", "module/", "submodule/",
+                    "licenses/", "frontend/dist/", "runtime/",
+                ].iter().any(|prefix| name.starts_with(prefix))
+                    || matches!(
+                        name.as_str(),
+                        "alas.py" | "gui.py" | "mcp_server_sse.py" | "tui.py" | "pyproject.toml"
+                        | "uv.lock" | "LICENSE" | ".azurpilot/independent.json"
+                        | ".azurpilot/independent-files.json" | "config/template.json"
+                    )
+                    || (name.starts_with("config/deploy.template") && name.ends_with(".yaml")
+                        && name.matches('/').count() == 1);
+                if !allowed {
+                    bail!("Unexpected file in staged installation: {name}");
+                }
+                changed.insert(name);
+            }
+        }
+    }
+    progress(SplashUpdate::loading(
+        t!("components.installing"),
+        t!("components.installing_detail"),
+        95,
+    ));
+    commit(root, &changed, cancel)?;
+    info!("Standalone environment installed");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{io::Cursor, net::TcpListener, sync::atomic::Ordering, thread};
     use zip::write::SimpleFileOptions;
+
+    #[cfg(feature = "independent")]
+    #[test]
+    fn standalone_deployment_reuses_runtime_and_preserves_user_files_on_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let cancel = AtomicBool::new(false);
+        for (name, body) in [("config/deploy.yaml", "custom"), ("config/azurpilot.db", "data"),
+                              ("log/launcher.txt", "previous failure")] {
+            let path = root.join(name);
+            crate::fs_util::ensure_parent_dir(&path).unwrap();
+            fs::write(path, body).unwrap();
+        }
+        assert!(deployment_required(root));
+        let files = [
+            ".azurpilot/independent.json", ".azurpilot/independent-files.json", "gui.py",
+            "frontend/dist/index.html", "runtime/independent_update.py", "runtime/python/python.exe",
+            "runtime/git/cmd/git.exe", "runtime/adb/adb.exe", "runtime/nodejs/node.exe",
+        ];
+        deploy_independent(root, |stage, _| {
+            for name in files {
+                let path = stage.join(name);
+                crate::fs_util::ensure_parent_dir(&path)?;
+                fs::write(path, "installed")?;
+            }
+            Ok(())
+        }, &mut |_| {}, &cancel).unwrap();
+        assert!(!deployment_required(root));
+
+        let old = root.join("runtime/python/obsolete.pyd");
+        fs::write(&old, "stale").unwrap();
+        assert!(deploy_independent(root, |stage, _| {
+            let path = stage.join("config/deploy.yaml");
+            crate::fs_util::ensure_parent_dir(&path)?;
+            fs::write(path, "do not overwrite")?;
+            Ok(())
+        }, &mut |_| {}, &cancel).is_err());
+        assert!(old.is_file());
+        assert_eq!(fs::read_to_string(root.join("config/deploy.yaml")).unwrap(), "custom");
+        deploy_independent(root, |stage, _| {
+            for name in files.into_iter().filter(|name| name.starts_with("runtime/")) {
+                let path = stage.join(name);
+                crate::fs_util::ensure_parent_dir(&path)?;
+                fs::write(path, "repaired")?;
+            }
+            Ok(())
+        }, &mut |_| {}, &cancel).unwrap();
+        assert!(!deployment_required(root));
+        assert!(!old.exists());
+        assert_eq!(fs::read_to_string(root.join("gui.py")).unwrap(), "installed");
+        assert_eq!(fs::read_to_string(root.join("config/azurpilot.db")).unwrap(), "data");
+        assert_eq!(fs::read_to_string(root.join("log/launcher.txt")).unwrap(), "previous failure");
+    }
 
     fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -1110,14 +1271,14 @@ mod tests {
     #[test]
     fn empty_install_then_only_missing_component_is_redeployed() {
         let root = tempfile::tempdir().unwrap();
-        assert!(deployment_required(root.path()));
+        assert!(managed_deployment_required(root.path()));
         let manifest = fixture(root.path(), 1);
         apply(root.path(), manifest.clone()).unwrap();
-        assert!(!deployment_required(root.path()));
+        assert!(!managed_deployment_required(root.path()));
         let receipt = read_receipt(root.path()).unwrap();
         let missing = receipt.components["adb"].files.keys().next().unwrap();
         fs::remove_file(root.path().join(missing)).unwrap();
-        assert!(deployment_required(root.path()));
+        assert!(managed_deployment_required(root.path()));
         // 只有 adb ZIP 留在缓存，其他源不可访问；成功说明没有重复请求完整组件。
         for component in &manifest.platforms[&platform()] {
             if component.id != "adb" {
@@ -1131,7 +1292,7 @@ mod tests {
         fs::create_dir_all(root.path().join("config")).unwrap();
         fs::write(root.path().join("config/user.json"), "keep").unwrap();
         apply(root.path(), manifest).unwrap();
-        assert!(!deployment_required(root.path()));
+        assert!(!managed_deployment_required(root.path()));
         assert_eq!(
             fs::read_to_string(root.path().join("config/user.json")).unwrap(),
             "keep"
@@ -1147,9 +1308,9 @@ mod tests {
         fs::remove_file(root.path().join(RECEIPT)).unwrap();
         assert!(!root.path().join("gui.py").exists());
         assert!(!root.path().join(".venv").exists());
-        assert!(!deployment_required(root.path()));
+        assert!(!managed_deployment_required(root.path()));
         fs::remove_file(root.path().join("deploy/git.py")).unwrap();
-        assert!(deployment_required(root.path()));
+        assert!(managed_deployment_required(root.path()));
     }
 
     #[test]
@@ -1172,9 +1333,9 @@ mod tests {
             fs::write(path, "existing tool").unwrap();
         }
         remember_manifest(root.path(), serde_json::to_value(manifest).unwrap()).unwrap();
-        assert!(!deployment_required(root.path()));
+        assert!(!managed_deployment_required(root.path()));
         fs::remove_file(root.path().join(adb)).unwrap();
-        assert!(deployment_required(root.path()));
+        assert!(managed_deployment_required(root.path()));
     }
 
     #[test]
@@ -1217,7 +1378,7 @@ mod tests {
         )
         .unwrap();
         // Ordinary readiness checks never compare file contents or digests.
-        assert!(!deployment_required(root.path()));
+        assert!(!managed_deployment_required(root.path()));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -1311,7 +1472,7 @@ mod tests {
             }
         }
         assert_eq!(fs::read(root.path().join(git)).unwrap(), original);
-        assert!(!deployment_required(root.path()));
+        assert!(!managed_deployment_required(root.path()));
     }
 
     #[test]
@@ -1339,7 +1500,7 @@ mod tests {
             );
         }
         assert_eq!(fs::read(root.path().join(RECEIPT)).unwrap(), receipt);
-        assert!(!deployment_required(root.path()));
+        assert!(!managed_deployment_required(root.path()));
     }
 
     #[test]
@@ -1357,7 +1518,7 @@ mod tests {
                 .join(".azurpilot/tools/git/libexec/git-core/obsolete")
         };
         assert!(!obsolete.exists());
-        assert!(!deployment_required(root.path()));
+        assert!(!managed_deployment_required(root.path()));
         assert_eq!(
             fs::read_to_string(root.path().join("custom.py")).unwrap(),
             "user"
@@ -1379,7 +1540,7 @@ mod tests {
             .unwrap();
         adb.sha256 = "0".repeat(64);
         assert!(apply(root.path(), next).is_err());
-        assert!(!deployment_required(root.path()));
+        assert!(!managed_deployment_required(root.path()));
     }
 
     #[test]
@@ -1430,7 +1591,7 @@ mod tests {
             &Preferences::default()
         )
         .is_err());
-        assert!(!deployment_required(root.path()));
+        assert!(!managed_deployment_required(root.path()));
     }
 
     #[test]
@@ -1589,7 +1750,7 @@ mod tests {
         );
         assert!(attempt.is_err());
         assert_eq!(first.join().unwrap().len(), 2);
-        assert!(deployment_required(root.path()));
+        assert!(managed_deployment_required(root.path()));
         assert!(!root.path().join(RECEIPT).exists());
 
         let (base, retry) = server(vec![(200, "Deploy: {}")]);
@@ -1609,7 +1770,7 @@ mod tests {
         let requests = retry.join().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains(platform_template_file(&sources)));
-        assert!(!deployment_required(root.path()));
+        assert!(!managed_deployment_required(root.path()));
         assert_eq!(
             fs::read_to_string(root.path().join(BOOTSTRAP_MARKER)).unwrap(),
             "# already downloaded"
@@ -1619,7 +1780,7 @@ mod tests {
             "keep"
         );
         fs::remove_file(root.path().join("deploy/git.py")).unwrap();
-        assert!(deployment_required(root.path()));
+        assert!(managed_deployment_required(root.path()));
     }
 
     #[test]

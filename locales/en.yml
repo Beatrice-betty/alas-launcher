@@ -21,6 +21,8 @@ splash:
   startup_complete: "Startup complete!"
 
 setup:
+  bootstrap_required: "Deployment files are missing. Install the latest lightweight installer into this folder and reopen AzurPilot."
+  webview_required: "Microsoft WebView2 could not be prepared. Install the Microsoft WebView2 Runtime and reopen AzurPilot."
   preparing_workspace: "Preparing workspace"
   cleaning_cache: "Cleaning cache and checking local environment."
   checking_env: "Checking local environment... | Tips: %{tip}"
@@ -338,7 +340,7 @@ launcher:
   export_gui_log: "Export WebUI log"
   details: "Error details"
   repair_title: "Rebuild the runtime environment?"
-  repair_body: "Download and replace Git, ADB, deploy scripts, and the system template, then rebuild Python and dependencies. Other code, user settings, logs, and download caches are kept. Launch manually when repair completes."
+  repair_body: "Download Git, ADB, and other runtime tools again, rebuild Python and its dependencies, and restore missing program files. User settings, logs, and download caches are kept. Launch manually when repair completes."
   repair_confirm: "Start repair"
   cancel: "Cancel"
   click_cancel_hint: "Click to cancel"

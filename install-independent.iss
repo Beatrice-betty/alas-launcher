@@ -1,11 +1,12 @@
 ﻿#define PackageRoot GetEnv("AZURPILOT_PACKAGE_ROOT")
 #define OutputRoot GetEnv("AZURPILOT_PACKAGE_OUTPUT")
 #define VCRedist GetEnv("AZURPILOT_VC_REDIST")
+#define BootstrapRoot GetEnv("AZURPILOT_FULL_BOOTSTRAP")
 
 [Setup]
 AppId=AzurPilot.BeatriceBetty.Independent
 AppName=AzurPilot 独立版
-AppVersion=1.0.0
+AppVersion=1.0.1
 AppPublisher=Beatrice-betty
 DefaultDirName={localappdata}\AzurPilotIndependent
 DefaultGroupName=AzurPilot 独立版
@@ -45,6 +46,9 @@ Source: "{#PackageRoot}\AzurPilot.exe"; DestDir: "{app}"; Flags: ignoreversion
 #endif
 Source: "{#PackageRoot}\config\deploy.yaml"; DestDir: "{app}\config"; Flags: onlyifdoesntexist uninsneveruninstall
 Source: "{#VCRedist}"; DestName: "azurpilot-vc-x64.exe"; Flags: dontcopy
+#if BootstrapRoot != ""
+Source: "{#BootstrapRoot}\*"; DestDir: "{app}\.azurpilot\bootstrap"; Flags: ignoreversion recursesubdirs
+#endif
 
 [Icons]
 Name: "{group}\AzurPilot 独立版"; Filename: "{app}\AzurPilot.exe"; WorkingDir: "{app}"

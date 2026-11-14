@@ -140,7 +140,8 @@ def assemble(alas, release, key_path, *, package=None, inputs=None, python_root=
         })
         (root / '使用说明.txt').write_text(
             '打开 AzurPilot.exe 即可启动 ALAS。控制台默认使用本机端口 25549。\n'
-            '控制台的更新页只更新 ALAS 程序和网页。运行环境由完整安装包更新。\n'
+            '日常启动只更新 ALAS 程序和网页，沿用已装环境。\n'
+            '需要联网修复环境时，请先停止服务，再点「修复环境」。失败可点「导出启动器日志」。\n'
             '旧版配置和历史请先备份，再迁移到新安装目录。\n'
             'ALAS 与启动器的来源、许可证见软件附带文件。\n',
             encoding='utf-8',

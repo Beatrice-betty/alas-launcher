@@ -55,6 +55,8 @@ pub fn get_tip() -> String {
 /// 脚本执行的阶段细分，用于在总进度中区分 git 更新、前端构建与依赖同步。
 #[derive(Clone, Copy, Debug)]
 enum ScriptPhase {
+    /// 独立版首次部署和主动修复。
+    Independent,
     /// git 拉取仓库代码阶段。
     Git,
     /// 前端构建阶段（deploy.app / ensure_frontend，含 npm）。
@@ -421,11 +423,6 @@ pub fn setup_environment() -> Result<()> {
     fs::create_dir_all(&dir)?;
     set_current_dir(&dir)?;
     if cfg!(feature = "independent") {
-        let webview = dir.join("runtime/webview2");
-        if !webview.join("msedgewebview2.exe").is_file() {
-            bail!("安装包内的 WebView2 缺失，请用完整安装包修复");
-        }
-        std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", webview);
         return Ok(());
     }
     prepend_path_to_env("PATH", venv_bin_dir());
@@ -453,6 +450,75 @@ pub fn setup_environment() -> Result<()> {
             .join("adb"),
     );
     Ok(())
+}
+
+#[cfg(feature = "independent")]
+pub(crate) fn ensure_launcher_webview() -> Result<()> {
+    let root = azurpilot_repo_dir();
+    let fixed = root.join("runtime/webview2");
+    if fixed.join("msedgewebview2.exe").is_file() {
+        std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", &fixed);
+        return Ok(());
+    }
+    let available = || tauri::webview_version().is_ok_and(|version| !version.is_empty());
+    if available() {
+        return Ok(());
+    }
+    let installer = crate::components::secure_target(
+        &root, ".azurpilot/bootstrap/MicrosoftEdgeWebview2Setup.exe",
+    )?;
+    info!("Preparing Microsoft WebView2 for the launcher");
+    let message = t!("setup.webview_required").to_string();
+    if !installer.is_file() {
+        bail!("{message}");
+    }
+    let status = Command::new(installer)
+        .args(["/silent", "/install"])
+        .create_no_window()
+        .status()
+        .with_context(|| message.clone())?;
+    info!("Microsoft WebView2 installer exited with {status}");
+    if !status.success() || !available() {
+        bail!("{message}");
+    }
+    Ok(())
+}
+
+pub(crate) fn provision_independent(
+    mut progress: impl FnMut(SplashUpdate),
+    cancel: &AtomicBool,
+    repair: bool,
+) -> Result<()> {
+    let root = azurpilot_repo_dir();
+    let python = crate::components::secure_target(&root, ".azurpilot/bootstrap/python/python.exe")?;
+    let bootstrap = crate::components::secure_target(&root, ".azurpilot/bootstrap/bootstrap.py")?;
+    if !python.is_file() || !bootstrap.is_file() {
+        bail!(t!("setup.bootstrap_required"));
+    }
+    progress(SplashUpdate::loading(
+        t!("components.checking"),
+        t!("components.checking_detail"),
+        5,
+    ));
+    crate::components::deploy_independent(
+        &root,
+        |stage, progress| {
+            let mut command = Command::new(&python);
+            command
+                .args(["-IB", "-X", "utf8"])
+                .arg(&bootstrap)
+                .arg(&root)
+                .arg(stage)
+                .current_dir(&root);
+            if repair {
+                command.arg("--repair");
+            }
+            isolate_python_child_environment(&mut command);
+            run_command(&mut command, progress, ScriptPhase::Independent, cancel)
+        },
+        &mut progress,
+        cancel,
+    )
 }
 
 /// 设置 Unix 发行包 git 所需的环境变量（执行路径与模板目录）。
@@ -908,6 +974,7 @@ fn run_command(
     // 依赖阶段起点 60%，同步完成后再构建前端。
     let mut dependency_progress = 60.0;
     let phase_subtitle = match phase {
+        ScriptPhase::Independent => String::new(),
         ScriptPhase::Git => t!("setup.syncing", tip = get_tip()).to_string(),
         ScriptPhase::App => t!("setup.syncing", tip = get_tip()).to_string(),
         ScriptPhase::Dependencies => t!("setup.syncing_deps", tip = get_tip()).to_string(),
@@ -918,6 +985,7 @@ fn run_command(
     const UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
     let max_timeout = match phase {
+        ScriptPhase::Independent => Duration::from_secs(25 * 60),
         ScriptPhase::Git => Duration::from_secs(10 * 60),
         ScriptPhase::Dependencies => Duration::from_secs(25 * 60),
         ScriptPhase::App => Duration::from_secs(15 * 60),
@@ -962,7 +1030,9 @@ fn run_command(
                         last_err = line;
                     }
                 } else {
-                    info!("{line}");
+                    if !matches!(phase, ScriptPhase::Independent) || !line.starts_with("DOWNLOADED ") {
+                        info!("{line}");
+                    }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -1014,6 +1084,7 @@ fn run_command(
         // stderr 为空时用阶段默认文案兜底，保证错误提示永远有内容
         if last_err.is_empty() {
             last_err = match phase {
+                ScriptPhase::Independent => t!("launcher.deploy_failed").to_string(),
                 ScriptPhase::Git => t!("setup.update_failed").to_string(),
                 ScriptPhase::App => t!("setup.frontend_failed").to_string(),
                 ScriptPhase::Dependencies => t!("setup.deps_failed").to_string(),
@@ -1113,6 +1184,7 @@ fn run_status_command_with_tick(
 
 fn phase_display_name(phase: ScriptPhase) -> String {
     match phase {
+        ScriptPhase::Independent => t!("launcher.deploying").to_string(),
         ScriptPhase::Git => t!("setup.code_update").to_string(),
         ScriptPhase::App => t!("setup.building_frontend").to_string(),
         ScriptPhase::Dependencies => t!("setup.deps_update").to_string(),
@@ -1127,6 +1199,7 @@ fn splash_retry_update(phase: ScriptPhase, retry_count: usize, error_text: &str)
         error = error_text
     );
     match phase {
+        ScriptPhase::Independent => SplashUpdate::loading(t!("launcher.deploying"), detail, 5),
         ScriptPhase::Git => SplashUpdate::loading(t!("setup.retrying_update"), detail, 40)
             .with_subtitle(t!("setup.syncing", tip = get_tip())),
         ScriptPhase::App => SplashUpdate::loading(t!("setup.building_frontend"), detail, 86)
@@ -2460,6 +2533,29 @@ fn splash_update_for_output(
     }
 
     match phase {
+        ScriptPhase::Independent => {
+            if let Some(name) = sanitized.strip_prefix("COMPONENT ") {
+                return Some(SplashUpdate::loading(
+                    format!("{} · {name}", t!("components.downloading")),
+                    name,
+                    10,
+                ));
+            }
+            if let Some((done, total)) = sanitized.strip_prefix("DOWNLOADED ").and_then(|s| s.split_once('/')) {
+                let fraction = done.parse::<f64>().ok()? / total.parse::<f64>().ok()?.max(1.0);
+                return Some(SplashUpdate::loading(
+                    format!("{} · {done}/{total}", t!("components.downloading")),
+                    t!("setup.verifying_deps"),
+                    20.0 + 35.0 * fraction,
+                ));
+            }
+            match sanitized {
+                "STEP 4" => Some(dependency_start_update()),
+                "STEP 5" => Some(SplashUpdate::loading(t!("setup.updating"), t!("setup.fetching_patches"), 72)),
+                "STEP 6" => Some(SplashUpdate::loading(t!("components.checking"), t!("components.checking_detail"), 90)),
+                _ => None,
+            }
+        }
         ScriptPhase::Git => splash_update_for_git_output(sanitized, git_progress),
         ScriptPhase::App => None,
         ScriptPhase::Dependencies => splash_update_for_dependency_output(sanitized, uv_progress),

@@ -12,24 +12,28 @@ from urllib.parse import unquote, urlsplit
 from packaging.tags import parse_tag, sys_tags
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
-
 TOOLS = Path(__file__).resolve().parent
 GIT_SHA256 = '4a92850b6e917da4fd010669b614b55dccf5b0ec333a534cc4be4700dfefdafd'
 ADB_SHA256 = '45f4d63113e895ebde0c90f194099a4676b6ac653bd28d54314a9e022bbc1a99'
-WEBVIEW2 = {
-    'filename': 'Microsoft.WebView2.FixedVersionRuntime.157.0.4341.46.x64.cab',
-    'sha256': '0ac7317a08c3f3beebbb9b6d90f5b77352569f0a33a54a15ef6aaabc82899b7c',
+WEBVIEW2_SETUP_SHA256 = 'cf2f2445fef0c5c14e372045f84998771eeb8bb01d59be4afd00692fa160082e'
+GIT = {
+    'filename': 'MinGit-2.56.1-64-bit.zip',
+    'sha256': GIT_SHA256,
     'urls': [
-        'https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/'
-        'edb19202-9173-4dd1-ab87-c45c2d80aaec/Microsoft.WebView2.FixedVersionRuntime.157.0.4341.46.x64.cab',
+        'https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/MinGit-2.56.1-64-bit.zip',
     ],
+}
+ADB = {
+    'filename': 'platform-tools_r37.0.1-win.zip',
+    'sha256': ADB_SHA256,
+    'urls': ['https://dl.google.com/android/repository/platform-tools_r37.0.1-win.zip'],
 }
 VC_RUNTIME = {
     'filename': 'VC_redist.x64.exe',
     'sha256': '9c02c9ed120f671b900e6b9471d890e3b2414117a7e53f4ae2e855466fa2b7c9',
     'urls': [
-        'https://download.visualstudio.microsoft.com/download/pr/78d061c5-9ef3-42ab-98ed-3309d1095dc4/'
-        '9C02C9ED120F671B900E6B9471D890E3B2414117A7E53F4AE2E855466FA2B7C9/VC_redist.x64.exe',
+        ('https://download.visualstudio.microsoft.com/download/pr/78d061c5-9ef3-42ab-98ed-3309d1095dc4/'
+         '9C02C9ED120F671B900E6B9471D890E3B2414117A7E53F4AE2E855466FA2B7C9/VC_redist.x64.exe'),
     ],
 }
 
@@ -86,10 +90,10 @@ def pinned_wheels(package, installed, local_wheel, bootstrap, digest):
     return wheels
 
 
-def assemble(package, release, inputs, installed, local_wheel, output):
+def assemble(package, release, inputs, installed, local_wheel, webview2_setup, output):
     sys.path.insert(0, str(package))
-    from deploy import independent
     from build_independent import NODE_DIRECTORY, NODE_SHA256
+    from deploy import independent
 
     receipt = independent.read_json(package / independent.RECEIPT)
     signed = independent.verify_manifest(independent.read_json(release / 'release.json'), receipt['publicKey'])
@@ -104,12 +108,21 @@ def assemble(package, release, inputs, installed, local_wheel, output):
     node_zip = inputs / (NODE_DIRECTORY + '.zip')
     if independent.digest(node_zip) != NODE_SHA256:
         raise ValueError('Node.js 官方发行包 SHA-256 不匹配')
+    if independent.digest(webview2_setup) != WEBVIEW2_SETUP_SHA256:
+        raise ValueError('微软 WebView2 引导程序 SHA-256 不匹配。')
 
     output.mkdir(parents=True, exist_ok=False)
     bootstrap = output / 'bootstrap'
     bootstrap.mkdir()
-    for name in ('AzurPilot.exe', 'LICENSE', 'launcher-LICENSE.txt', '使用说明.txt'):
+    for name in ('AzurPilot.exe', 'LICENSE', 'launcher-LICENSE.txt'):
         shutil.copy2(package / name, output)
+    (output / '使用说明.txt').write_text(
+        '装完简装包后，打开 AzurPilot，在启动器里点「部署」。\n'
+        '组件和本体下载完成后点「启动」。以后的启动沿用已装环境，只更新 ALAS 和网页。\n'
+        '下载失败可重试，也可点「导出启动器日志」。日志在安装目录的 log 文件夹。\n'
+        '需要主动修复时，请先停服务，再点「修复环境」。控制台默认使用本机的 25549 端口。\n',
+        encoding='utf-8',
+    )
 
     python = package / 'runtime/python'
 
@@ -120,19 +133,20 @@ def assemble(package, release, inputs, installed, local_wheel, output):
         return ignored
 
     shutil.copytree(python, bootstrap / 'python', ignore=ignore_installed)
-    shutil.copy2(inputs / 'mingit.zip', bootstrap / 'git.zip')
-    shutil.copy2(inputs / 'adb.zip', bootstrap)
+    shutil.copy2(webview2_setup, bootstrap / 'MicrosoftEdgeWebview2Setup.exe')
     shutil.copytree(package / 'runtime/atx', bootstrap / 'atx')
     shutil.copy2(package / 'runtime/components.json', bootstrap)
     shutil.copy2(package / 'config/deploy.yaml', bootstrap)
     shutil.copy2(package / 'deploy/independent.py', bootstrap)
+    deploy = bootstrap / 'deploy'
+    deploy.mkdir()
+    for name in ('utils.py', 'atomic.py'):
+        shutil.copy2(package / 'deploy' / name, deploy)
     shutil.copy2(package / independent.RECEIPT, bootstrap / 'receipt.json')
     shutil.copy2(TOOLS / 'bootstrap_independent_lite.py', bootstrap / 'bootstrap.py')
-    for name in ('release.json', 'frontend.zip'):
-        shutil.copy2(release / name, bootstrap)
     wheels = pinned_wheels(package, installed, local_wheel, bootstrap, independent.digest)
     independent.write_json(bootstrap / 'downloads.json', {
-        'webview2': WEBVIEW2, 'vc_runtime': VC_RUNTIME, 'wheels': wheels,
+        'git': GIT, 'adb': ADB, 'vc_runtime': VC_RUNTIME, 'wheels': wheels,
         'nodejs': {
             'filename': node_zip.name, 'size': node_zip.stat().st_size, 'sha256': NODE_SHA256,
             'urls': [f'{base}/v24.22.2/{node_zip.name}' for base in (
@@ -148,11 +162,11 @@ def assemble(package, release, inputs, installed, local_wheel, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ('package', 'release', 'inputs', 'installed', 'local-wheel', 'output'):
+    for name in ('package', 'release', 'inputs', 'installed', 'local-wheel', 'webview2-setup', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
     args = parser.parse_args()
     assemble(*(getattr(args, name).resolve() for name in (
-        'package', 'release', 'inputs', 'installed', 'local_wheel', 'output',
+        'package', 'release', 'inputs', 'installed', 'local_wheel', 'webview2_setup', 'output',
     )))
 
 

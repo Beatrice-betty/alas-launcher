@@ -36,6 +36,7 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 #[cfg(any(windows, target_os = "macos"))]
 use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, State, WebviewWindow};
+#[cfg(not(feature = "independent"))]
 use tauri_plugin_dialog::DialogExt;
 use tracing::{debug, info, warn};
 
@@ -112,7 +113,7 @@ impl Model {
                 update_version: None,
                 update_checked: cfg!(feature = "independent"),
                 backend_running: false,
-                deployment_required: !cfg!(feature = "independent"),
+                deployment_required: true,
                 progress: None,
                 error: None,
                 error_code: None,
@@ -142,7 +143,7 @@ impl Model {
         let ready = free && view.update_checked && self.update.is_none() && !view.backend_running;
         view.can_start = ready && !view.deployment_required;
         view.can_deploy = ready && view.deployment_required;
-        view.can_repair = ready && !cfg!(feature = "independent");
+        view.can_repair = ready;
         view.can_stop = free && view.backend_running;
         view.can_check = free && !view.backend_running && !cfg!(feature = "independent");
         view.can_update = free && self.update.is_some();
@@ -496,28 +497,29 @@ impl Launcher {
     }
 
     fn deploy(self: &Arc<Self>) -> Result<()> {
-        if cfg!(feature = "independent") {
-            bail!("请使用完整离线安装包部署");
-        }
         let (task, cancel) = self.begin(Operation::Deploy)?;
         let controller = self.clone();
         thread::spawn(move || {
             let result = (|| {
-                crate::components::deploy(
-                    &setup::azurpilot_repo_dir(),
-                    &mut |mut update: SplashUpdate| {
-                        update.progress =
-                            ((update.progress - 5.0) / 19.0 * 100.0).clamp(0.0, 100.0);
-                        controller.publish(task, update);
-                    },
-                    cancel.clone(),
-                    controller.skip_update,
-                    &controller
-                        .app
-                        .state::<Arc<crate::settings::Store>>()
-                        .get()
-                        .sources,
-                )?;
+                if cfg!(feature = "independent") {
+                    setup::provision_independent(|u| controller.publish(task, u), &cancel, false)?;
+                } else {
+                    crate::components::deploy(
+                        &setup::azurpilot_repo_dir(),
+                        &mut |mut update: SplashUpdate| {
+                            update.progress =
+                                ((update.progress - 5.0) / 19.0 * 100.0).clamp(0.0, 100.0);
+                            controller.publish(task, update);
+                        },
+                        cancel.clone(),
+                        controller.skip_update,
+                        &controller
+                            .app
+                            .state::<Arc<crate::settings::Store>>()
+                            .get()
+                            .sources,
+                    )?;
+                }
                 ensure_not_cancelled(&cancel)?;
                 controller.change(|model| {
                     if model.accepts(task) {
@@ -589,22 +591,23 @@ impl Launcher {
     }
 
     fn repair(self: &Arc<Self>) -> Result<()> {
-        if cfg!(feature = "independent") {
-            bail!("请使用同版本完整安装包修复运行环境");
-        }
         let (task, cancel) = self.begin(Operation::Repair)?;
         let controller = self.clone();
         thread::spawn(move || {
             let result = (|| {
-                setup::repair_environment(
-                    |u| controller.publish(task, u),
-                    cancel,
-                    &controller
-                        .app
-                        .state::<Arc<crate::settings::Store>>()
-                        .get()
-                        .sources,
-                )?;
+                if cfg!(feature = "independent") {
+                    setup::provision_independent(|u| controller.publish(task, u), &cancel, true)?;
+                } else {
+                    setup::repair_environment(
+                        |u| controller.publish(task, u),
+                        cancel,
+                        &controller
+                            .app
+                            .state::<Arc<crate::settings::Store>>()
+                            .get()
+                            .sources,
+                    )?;
+                }
                 controller.change(|m| {
                     if m.accepts(task) {
                         m.view.message = Some(t!("launcher.repair_done").to_string());
@@ -1028,6 +1031,21 @@ pub(crate) fn run() -> Result<()> {
     setup_environment()?;
     let _log_guard = initialize_logging()?;
     crate::i18n::init();
+    #[cfg(feature = "independent")]
+    if let Err(error) = setup::ensure_launcher_webview() {
+        warn!("WebView2 prerequisite: {error:#}");
+        #[cfg(windows)]
+        {
+            let message: Vec<u16> = format!("{error:#}\n\nlog\\{}", crate::today_launcher_log_filename())
+                .encode_utf16().chain([0]).collect();
+            let title: Vec<u16> = "AzurPilot".encode_utf16().chain([0]).collect();
+            unsafe {
+                use winapi::um::winuser::{MessageBoxW, MB_ICONERROR};
+                MessageBoxW(std::ptr::null_mut(), message.as_ptr(), title.as_ptr(), MB_ICONERROR);
+            }
+        }
+        return Err(error);
+    }
     let allow_exit = Arc::new(AtomicBool::new(false));
     let allow_for_setup = allow_exit.clone();
     let allow_for_run = allow_exit.clone();
@@ -1124,7 +1142,16 @@ pub(crate) fn run() -> Result<()> {
                 if let Some(window) = app.get_webview_window("launcher") { window.set_title("AzurPilot Debug")?; }
                 show_launcher_home(app.handle())?;
             } else if cfg!(feature = "independent") {
-                controller.start()?;
+                let needs_deploy = crate::components::deployment_required(&setup::azurpilot_repo_dir());
+                controller.change(|model| {
+                    model.view.deployment_required = needs_deploy;
+                    model.touch();
+                });
+                if needs_deploy {
+                    show_launcher_home(app.handle())?;
+                } else {
+                    controller.start()?;
+                }
             } else {
                 controller.check(auto_start)?;
             }
@@ -1318,10 +1345,12 @@ mod tests {
     }
     #[cfg(feature = "independent")]
     #[test]
-    fn independent_model_starts_without_launcher_update_check() {
+    fn independent_deploy_and_start_do_not_check_for_launcher_updates() {
         let mut model = Model::new();
-        assert!(model.snapshot().can_start);
+        assert!(model.snapshot().can_deploy);
+        assert!(!model.snapshot().can_start);
         assert!(!model.snapshot().can_check);
+        model.view.deployment_required = false;
         assert!(model.begin(Operation::Start).is_ok());
     }
 
@@ -1367,6 +1396,7 @@ mod tests {
         assert_eq!(model.view.phase, Phase::Starting);
     }
     #[test]
+    #[cfg(not(feature = "independent"))]
     fn update_gate_and_failed_checks_cannot_be_bypassed() {
         let mut m = Model::new();
         assert!(m.begin(Operation::Start).is_err());

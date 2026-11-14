@@ -78,7 +78,7 @@ pub(crate) fn is_backend_startup_timeout(error: &anyhow::Error) -> bool {
 pub struct WebuiLaunchConfig {
     /// WebUI 监听地址，默认 `127.0.0.1`，仅允许本机访问。
     pub host: String,
-    /// WebUI 监听端口，默认 22267，与 AzurPilot 上游约定一致。
+    /// WebUI 监听端口，独立版默认 25549，其他版本默认 22267。
     pub port: u16,
     /// WebUI 访问密码；缺失时后端以无密码模式运行。
     pub password: Option<String>,
@@ -114,7 +114,7 @@ impl WebuiLaunchConfig {
             port: webui
                 .and_then(|webui| webui.get("WebuiPort"))
                 .and_then(value_as_u16)
-                .unwrap_or(22267),
+                .unwrap_or(if cfg!(feature = "independent") { 25549 } else { 22267 }),
             password: webui
                 .and_then(|webui| webui.get("Password"))
                 .and_then(value_as_string)

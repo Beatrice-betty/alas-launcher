@@ -11,6 +11,7 @@ param(
     [string]$ISCC,
     [string]$Launcher,
     [string]$VCRedist,
+    [string]$BootstrapRoot,
     [switch]$UseLocalCertificate
 )
 
@@ -37,7 +38,8 @@ if ($LASTEXITCODE) { throw 'The launcher contains local build paths or the priva
 $variables = @(
     'WINDOWS_SIGNING_PFX_B64', 'WINDOWS_SIGNING_PASSWORD', 'WINDOWS_SIGNING_ALLOW_SELF_SIGNED',
     'AZURPILOT_LITE_ROOT', 'AZURPILOT_LITE_OUTPUT',
-    'AZURPILOT_PACKAGE_ROOT', 'AZURPILOT_PACKAGE_OUTPUT', 'AZURPILOT_VC_REDIST'
+    'AZURPILOT_PACKAGE_ROOT', 'AZURPILOT_PACKAGE_OUTPUT', 'AZURPILOT_VC_REDIST',
+    'AZURPILOT_FULL_BOOTSTRAP'
 )
 $previous = @{}
 foreach ($name in $variables) { $previous[$name] = [Environment]::GetEnvironmentVariable($name) }
@@ -64,10 +66,12 @@ try {
         $env:AZURPILOT_LITE_OUTPUT = $destination
     } else {
         if (-not $VCRedist) { throw 'The full installer needs -VCRedist.' }
+        if (-not $BootstrapRoot) { throw 'The full installer needs -BootstrapRoot (the lite bootstrap folder).' }
         $script = Join-Path $repo 'install-independent.iss'
         $env:AZURPILOT_PACKAGE_ROOT = $source
         $env:AZURPILOT_PACKAGE_OUTPUT = $destination
         $env:AZURPILOT_VC_REDIST = (Resolve-Path -LiteralPath $VCRedist).Path
+        $env:AZURPILOT_FULL_BOOTSTRAP = (Resolve-Path -LiteralPath $BootstrapRoot).Path
     }
     $signCommand = '$q' + $pwshPath + '$q -NoProfile -NonInteractive -File $q' + $signer + '$q -Path $f'
     & $compiler /Qp '/DCodeSigning' "/DSignedLauncher=$signedLauncher" "/Sazurpilot=$signCommand" $script
