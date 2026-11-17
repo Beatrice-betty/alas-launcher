@@ -558,6 +558,30 @@ fn setup_git_ca_bundle() {
     }
 }
 
+pub(crate) fn recover_independent_update(root: &Path) -> Result<bool> {
+    let journal = root.join(".azurpilot/independent-update/transaction.json");
+    if !journal.try_exists()? {
+        return Ok(false);
+    }
+    // 恢复脚本与 Python 运行时一起部署。即使候选版的入口无法导入也能恢复。
+    let mut command = Command::new(root.join("runtime/python/python.exe"));
+    command
+        .args(["-B", "runtime/independent_update.py", "recover"])
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONUTF8", "1")
+        .current_dir(root)
+        .create_no_window();
+    isolate_python_child_environment(&mut command);
+    let result = command.output()?;
+    if !result.status.success() {
+        bail!("无法恢复上次更新：{}", String::from_utf8_lossy(&result.stderr));
+    }
+    if journal.try_exists()? {
+        bail!("恢复后仍有未完成的更新记录");
+    }
+    Ok(true)
+}
+
 /// 启动环境入口：确认引导物齐备 → 工具安装 → 配置迁移 → 仓库更新 →
 /// 依赖同步 → 前端构建。
 ///
@@ -578,25 +602,10 @@ pub fn setup_azurpilot_repo(
     if cfg!(feature = "independent") {
         let root = azurpilot_repo_dir();
         let python = venv_python();
-        let recovery_script = "runtime/independent_update.py";
-        if !python.is_file() || !root.join(recovery_script).is_file() {
+        if !python.is_file() || !root.join("runtime/independent_update.py").is_file() {
             bail!("安装包缺少本地运行环境，请用完整安装包修复");
         }
-        let recover = || -> Result<()> {
-            let result = Command::new(&python)
-                .args(["-B", recovery_script, "recover"])
-                .env("PYTHONNOUSERSITE", "1")
-                .env_remove("PYTHONHOME")
-                .env_remove("PYTHONPATH")
-                .current_dir(&root)
-                .create_no_window()
-                .output()?;
-            if !result.status.success() {
-                bail!("无法恢复上次更新：{}", String::from_utf8_lossy(&result.stderr));
-            }
-            Ok(())
-        };
-        recover()?;
+        let recovered = recover_independent_update(&root)?;
         for path in ["gui.py", "frontend/dist/index.html", ".azurpilot/independent.json",
                      "runtime/adb/adb.exe", "runtime/git/cmd/git.exe"] {
             if !root.join(path).is_file() {
@@ -609,38 +618,44 @@ pub fn setup_azurpilot_repo(
                 config.pointer("/Deploy/Update/EnableReload").and_then(JsonValue::as_bool)
             })
             .unwrap_or(true);
-        if !skip_repository_update && supervised {
+        let check_update = !skip_repository_update && !recovered && supervised;
+        if check_update {
             status_updater(SplashUpdate::loading(
                 t!("setup.updating"),
                 t!("setup.fetching_patches"),
                 41,
             ));
-            let mut update = Command::new(&python);
-            update
-                .args([
-                    "-B",
-                    "-c",
-                    concat!(
-                        "from deploy import independent\n",
-                        "offer = independent.check()\n",
-                        "if offer is not None:\n",
-                        "    ready = independent.prepare(offer)\n",
-                        "    independent.apply(ready)\n",
-                        "    print(f'ALAS 更新已就绪：{offer[0][\"revision\"]}')\n",
-                    ),
-                ])
-                .current_dir(&root)
-                .env("PYTHONNOUSERSITE", "1")
-                .env("PYTHONUTF8", "1");
-            isolate_python_child_environment(&mut update);
-            if let Err(error) =
-                run_command(&mut update, status_updater, ScriptPhase::Git, &cancel_requested)
-            {
-                // A cancelled updater may have been replacing files when it stopped.
-                recover()?;
-                crate::launcher::ensure_not_cancelled(&cancel_requested)?;
-                warn!("Independent startup update skipped: {error:#}");
-            }
+        }
+        let mut update = Command::new(&python);
+        update
+            .args([
+                "-B",
+                "-c",
+                concat!(
+                    "import sys\n",
+                    "from deploy import independent\n",
+                    "if sys.argv[1] == 'update':\n",
+                    "    offer = independent.check()\n",
+                    "    if offer is not None:\n",
+                    "        ready = independent.prepare(offer)\n",
+                    "        independent.apply(ready)\n",
+                    "        print(f'ALAS 更新已就绪：{offer[0][\"revision\"]}')\n",
+                    "elif hasattr(independent, 'clean_abandoned'):\n",
+                    "    independent.clean_abandoned()\n",
+                ),
+                if check_update { "update" } else { "cleanup" },
+            ])
+            .current_dir(&root)
+            .env("PYTHONNOUSERSITE", "1")
+            .env("PYTHONUTF8", "1");
+        isolate_python_child_environment(&mut update);
+        if let Err(error) =
+            run_command(&mut update, status_updater, ScriptPhase::Git, &cancel_requested)
+        {
+            // 取消或中断可能发生在写入一半时，先恢复再决定是否启动。
+            recover_independent_update(&root)?;
+            crate::launcher::ensure_not_cancelled(&cancel_requested)?;
+            warn!("Independent startup update skipped: {error:#}");
         }
         return Ok(());
     }

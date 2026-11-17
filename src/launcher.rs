@@ -40,6 +40,19 @@ use tauri::{Manager, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 use tracing::{debug, info, warn};
 
+fn start_with_update_recovery<T>(
+    mut start: impl FnMut() -> Result<T>,
+    recover: impl FnOnce() -> Result<bool>,
+) -> Result<T> {
+    match start() {
+        Err(error) if recover()? => {
+            warn!("Candidate backend failed to start; retrying the restored installation: {error:#}");
+            start()
+        }
+        result => result,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Phase {
@@ -544,25 +557,41 @@ impl Launcher {
         let controller = self.clone();
         thread::spawn(move || {
             let result = (|| {
+                let sources = controller.app.state::<Arc<crate::settings::Store>>().get().sources;
                 setup_azurpilot_repo(
                     |u| controller.publish(task, u),
                     cancel.clone(),
                     controller.skip_update,
-                    &controller
-                        .app
-                        .state::<Arc<crate::settings::Store>>()
-                        .get()
-                        .sources,
+                    &sources,
                 )?;
                 ensure_not_cancelled(&cancel)?;
-                let mut config =
-                    WebuiLaunchConfig::from_deploy_config(get_deploy_config().as_ref());
-                config.port = controller.port;
                 controller.publish(
                     task,
                     SplashUpdate::loading(t!("splash.starting"), t!("splash.starting_backend"), 97),
                 );
-                let backend = ManagedBackend::new_cancellable(&config, &cancel)?;
+                let backend = start_with_update_recovery(
+                    || {
+                        let mut config =
+                            WebuiLaunchConfig::from_deploy_config(get_deploy_config().as_ref());
+                        config.port = controller.port;
+                        ManagedBackend::new_cancellable(&config, &cancel)
+                    },
+                    || {
+                        if !cfg!(feature = "independent") || cancel.load(Ordering::Acquire) {
+                            return Ok(false);
+                        }
+                        if !setup::recover_independent_update(&setup::azurpilot_repo_dir())? {
+                            return Ok(false);
+                        }
+                        setup_azurpilot_repo(
+                            |u| controller.publish(task, u),
+                            cancel.clone(),
+                            true,
+                            &sources,
+                        )?;
+                        Ok(true)
+                    },
+                )?;
                 // Prevent cancellation racing with adoption of a newly spawned backend.
                 {
                     let mut model = controller.model.lock().unwrap();
@@ -1305,6 +1334,43 @@ fn create_tray(_app: &mut tauri::App) -> Result<()> {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use std::cell::Cell;
+
+    #[test]
+    fn update_start_recovers_and_retries_only_once() {
+        let starts = Cell::new(0);
+        let recovered = Cell::new(false);
+        let result = start_with_update_recovery(
+            || {
+                starts.set(starts.get() + 1);
+                if recovered.get() {
+                    Ok("restored")
+                } else {
+                    Err(anyhow!("candidate failed to import"))
+                }
+            },
+            || {
+                recovered.set(true);
+                Ok(true)
+            },
+        );
+        assert_eq!(result.unwrap(), "restored");
+        assert_eq!(starts.get(), 2);
+    }
+
+    #[test]
+    fn update_start_preserves_error_without_pending_update() {
+        let starts = Cell::new(0);
+        let result = start_with_update_recovery::<()>(
+            || {
+                starts.set(starts.get() + 1);
+                Err(anyhow!("ordinary startup error"))
+            },
+            || Ok(false),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "ordinary startup error");
+        assert_eq!(starts.get(), 1);
+    }
 
     #[test]
     fn split_error_code_extracts_marker_and_cleans_text() {
